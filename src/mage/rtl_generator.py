@@ -1,24 +1,41 @@
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from llama_index.core import Document
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
+from llama_index.core.chat_engine import ContextChatEngine
 from pydantic import BaseModel
 
+from .compile_reviewer import compile_slang
 from .log_utils import get_logger
-from .prompts import FAILED_TRIAL_PROMPT, ORDER_PROMPT, RTL_4_SHOT_EXAMPLES
-from .sim_reviewer import check_syntax
+from .prompts import (
+    FAILED_TRIAL_PROMPT,
+    ORDER_PROMPT,
+    RTL_4_SHOT_EXAMPLES,
+    SV_LANGUAGE_DIRECTIVES_PROMPT,
+)
+from .sim_reviewer import check_syntax_iverilog
 from .token_counter import TokenCounter, TokenCounterCached
 from .utils import add_lineno
 
 logger = get_logger(__name__)
 
 SYSTEM_PROMPT = r"""
-You are an expert in RTL design. You can always write SystemVerilog code with no syntax errors and always reach correct functionality.
+You are an expert in RTL design.
+You can always write SystemVerilog code with
+no syntax errors and always reach correct functionality.
+
+All generated SystemVerilog code must strictly conform to the IEEE 1800-2017
+SystemVerilog Language Reference Manual (LRM) and follow the best practices
+described in "Verilog and SystemVerilog Gotchas: 101 Common Coding Errors and
+How to Avoid Them", by Stuart Sutherland and Don Mills.
+
+{sv_language_directives_prompt}
 """
 
 GENERATION_PROMPT = r"""
-Please write a module in SystemVerilog RTL language regarding to the given natural language specification.
-Try to understand the requirements above and give reasoning steps in natural language to achieve it.
+Write a module in SystemVerilog RTL language regarding to the given natural language specification.
+Understand the requirements above and give reasoning steps in natural language to achieve it.
 In addition, try to give advice to avoid syntax error.
 An SystemVerilog RTL module always starts with a line starting with the keyword 'module' followed by the module name.
 It ends with the keyword 'endmodule'.
@@ -53,7 +70,7 @@ Other requirements:
 5. NEVER USE 'inside' operator in RTL code. Code like 'state inside {STATE_B, STATE_C, STATE_D}' should NOT be used.
 6. Never USE 'unique' or 'unique0' keywords in RTL code. Code like 'unique case' should NOT be used.
 """
-# Some prompts above comes from:
+# Some prompts above come from:
 # @misc{ho2024verilogcoderautonomousverilogcoding,
 #       title={VerilogCoder: Autonomous Verilog Coding Agents with Graph-based Planning and Abstract Syntax Tree (AST)-based Waveform Tracing Tool},
 #       author={Chia-Tung Ho and Haoxing Ren and Brucek Khailany},
@@ -111,10 +128,38 @@ class RTLGenerator:
         self.failed_trial: List[ChatMessage] = []
         self.history: List[ChatMessage] = []
         self.max_trials = 5
-        self.enable_cache = False
+        self.enable_cache = (False,)
+        self.rag_chat_engine: Optional[ContextChatEngine] = None
 
     def reset(self):
         self.history = []
+
+    def init_rag(
+        self,
+        persist_dir: str = "./.vector_storage/tb_gen",
+        faiss_path: str = "./.faiss_storage/tb_gen_faiss.bin",
+        docs: Sequence[Document] = None,
+    ) -> None:
+        """
+        Build/load a vector index from docs, create a retriever and a chat engine.
+        """
+
+        if not docs:
+            logger.error(
+                "RTLGenerator No documents found to init RAG. "
+                "Vector index will not be created."
+            )
+            return
+
+        self.rag_chat_engine = self.token_counter.init_rag(
+            persist_dir=persist_dir,
+            faiss_path=faiss_path,
+            top_k=2,
+            memory_token_limit=1500,
+            docs=docs,
+        )
+
+        logger.info("RTLGenerator RAG initialized.")
 
     def set_failed_trial(
         self, failed_sim_log: str, previous_code: str, previous_tb: str
@@ -130,7 +175,7 @@ class RTLGenerator:
 
     def generate(self, messages: List[ChatMessage]) -> ChatResponse:
         logger.info(f"RTL generator input message: {messages}")
-        resp, token_cnt = self.token_counter.count_chat(messages)
+        resp, token_cnt = self.token_counter.count_chat(messages, self.rag_chat_engine)
         logger.info(f"Token count: {token_cnt}")
         logger.info(f"{resp.message.content}")
         return resp
@@ -149,7 +194,12 @@ class RTLGenerator:
 
     def get_init_prompt_messages(self, input_spec: str) -> List[ChatMessage]:
         ret = [
-            ChatMessage(content=SYSTEM_PROMPT, role=MessageRole.SYSTEM),
+            ChatMessage(
+                content=SYSTEM_PROMPT.format(
+                    sv_language_directives_prompt=SV_LANGUAGE_DIRECTIVES_PROMPT
+                ),
+                role=MessageRole.SYSTEM,
+            ),
             ChatMessage(
                 content=GENERATION_PROMPT.format(
                     input_spec=input_spec, examples_prompt=RTL_4_SHOT_EXAMPLES
@@ -239,9 +289,24 @@ class RTLGenerator:
             rtl_code = resp_obj.module
             with open(rtl_path, "w") as f:
                 f.write(rtl_code)
-            syntax_correct, syntax_output = check_syntax(rtl_path=rtl_path)
+            slang_ok, slang_out = compile_slang(rtl_path=rtl_path, mode="elab")
+            iver_ok, iver_out = check_syntax_iverilog(rtl_path=rtl_path)
+
+            # Treat as pass only if BOTH tools pass (so we fix anything either tool flags)
+            syntax_correct = slang_ok and iver_ok
+
+            # Concatenate logs so the LLM can address all errors in one go
+            syntax_output = (
+                "==== slang (syntax/elaboration) ====\n"
+                f"{slang_out}\n\n"
+                "==== iverilog (syntax) ====\n"
+                f"{iver_out}\n"
+            )
+
             if syntax_correct:
                 break
+
+            # Feed both tools' messages back to the LLM for a combined fix attempt
             self.history.extend(
                 [response.message]
                 + self.get_format_error_prompt_messages(syntax_output, rtl_code)
@@ -277,15 +342,29 @@ class RTLGenerator:
             for j in range(self.max_trials):
                 with open(rtl_path, "w") as f:
                     f.write(rtl_code)
-                syntax_correct, syntax_output = check_syntax(rtl_path=rtl_path)
+
+                slang_ok, slang_out = compile_slang(rtl_path=rtl_path, mode="elab")
+                iver_ok, iver_out = check_syntax_iverilog(rtl_path=rtl_path)
+
+                syntax_correct = slang_ok and iver_ok
+                syntax_output = (
+                    "==== slang (syntax/elaboration) ====\n"
+                    f"{slang_out}\n\n"
+                    "==== iverilog (syntax) ====\n"
+                    f"{iver_out}\n"
+                )
+
                 ret[i] = (syntax_correct, rtl_code)
                 logger.info(
-                    f"Candidate {i + 1} / {candidates_num} trial {j + 1} / {self.max_trials} syntax_correct: {syntax_correct}"
+                    f"Candidate {i + 1} / {candidates_num} trial {j + 1} / {self.max_trials} "
+                    f"syntax_correct: {syntax_correct}"
                 )
                 logger.info(f"RTL code: {rtl_code}")
+
                 if syntax_correct:
                     break
-                elif j < self.max_trials - 1:
+
+                if j < self.max_trials - 1:
                     candidate_history.extend(
                         self.get_format_error_prompt_messages(syntax_output, rtl_code)
                     )
@@ -305,17 +384,33 @@ class RTLGenerator:
         self.generated_tb = None
         self.generated_if = None
         self.history.extend(self.get_init_prompt_messages(input_spec))
+        syntax_correct = False
+        rtl_code = ""
         for _ in range(self.max_trials):
             # Don't add order message into history, to save token
             response = self.generate(self.history + self.get_order_prompt_messages())
             self.history.append(response.message)
             rtl_code = self.parse_output(response).module
+
             with open(rtl_path, "w") as f:
                 f.write(rtl_code)
-            syntax_correct, syntax_output = check_syntax(rtl_path=rtl_path)
+
+            # --- Dual syntax checks: slang (parse+elab) then iverilog (parse) ---
+            slang_ok, slang_out = compile_slang(rtl_path=rtl_path, mode="elab")
+            iver_ok, iver_out = check_syntax_iverilog(rtl_path=rtl_path)
+
+            syntax_correct = slang_ok and iver_ok
             if syntax_correct:
                 break
+
+            syntax_output = (
+                "==== slang (syntax/elaboration) ====\n"
+                f"{slang_out}\n\n"
+                "==== iverilog (syntax) ====\n"
+                f"{iver_out}\n"
+            )
             self.history.extend(
                 self.get_format_error_prompt_messages(syntax_output, rtl_code)
             )
+
         return (syntax_correct, rtl_code)

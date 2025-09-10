@@ -21,8 +21,8 @@ def stderr_all_lines_benign(stderr: str) -> bool:
     )
 
 
-def check_syntax(rtl_path: str) -> Tuple[bool, str]:
-    cmd = f"iverilog -t null -Wall -Winfloop -Wno-timescale -g2012 -o /dev/null {rtl_path}"
+def check_syntax_iverilog(rtl_path: str) -> Tuple[bool, str]:
+    cmd = f"oseda -2025.03 iverilog -t null -Wall -Winfloop -Wno-timescale -g2012 -o /dev/null {rtl_path}"
     is_pass, sim_output = run_bash_command(cmd, timeout=60)
     sim_output_obj = CommandResult.model_validate_json(sim_output)
     is_pass = (
@@ -58,7 +58,7 @@ def sim_review(
         golden_rtl_path = ""
     if os.path.isfile(vvp_name):
         os.remove(vvp_name)
-    cmd = "iverilog -Wall -Winfloop -Wno-timescale -g2012 -o {} {} {} {}; vvp -n {}".format(
+    cmd = "oseda -2025.03 iverilog -Wall -Winfloop -Wno-timescale -g2012 -o {} {} {} {}; oseda -2025.03 vvp -n {}".format(
         vvp_name, tb_path, rtl_path, golden_rtl_path, vvp_name
     )
     is_pass, sim_output = run_bash_command(cmd, timeout=60)
@@ -112,12 +112,12 @@ def sim_review_golden(
             if benchmark_type == TypeBenchmark.VERILOG_EVAL_V1
             else "dataset_spec-to-rtl"
         )
-        tb_path = f"{benchmark_path}/{folder}/{task_id}_test.sv"
+        tb_path = f"{output_path_per_run}/tb.sv"
         ref_path = f"{benchmark_path}/{folder}/{task_id}_ref.sv"
         vvp_name = f"{output_path_per_run}/sim_golden.vvp"
         if os.path.isfile(vvp_name):
             os.remove(vvp_name)
-        cmd = "iverilog -Wall -Winfloop -Wno-timescale -g2012 -s tb -o {} {} {} {}; vvp -n {}".format(
+        cmd = "oseda -2025.03 iverilog -Wall -Winfloop -Wno-timescale -g2012 -s tb -o {} {} {} {}; oseda -2025.03 vvp -n {}".format(
             vvp_name, tb_path, rtl_path, ref_path, vvp_name
         )
         is_pass, sim_output = run_bash_command(cmd, timeout=60)

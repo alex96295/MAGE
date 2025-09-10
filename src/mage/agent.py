@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -6,11 +7,14 @@ from typing import List, Tuple
 
 from llama_index.core.llms import LLM
 
+from .doc_utils import CorpusPaths, DocumentManager, ParserConfig
+from .lint_reviewer import LintReviewer
 from .log_utils import get_logger, set_log_dir, switch_log_to_file, switch_log_to_stdout
 from .rtl_editor import RTLEditor
 from .rtl_generator import RTLGenerator
 from .sim_judge import SimJudge
 from .sim_reviewer import SimReviewer
+from .style_reviewer import StyleReviewer
 from .tb_generator import TBGenerator
 from .token_counter import TokenCounter, TokenCounterCached
 
@@ -32,6 +36,9 @@ class TopAgent:
         self.redirect_log = False
         self.output_path = "./output"
         self.log_path = "./log"
+        self.assets_path = "./assets"
+        self.assets_docs_path = "./.documents"
+        self.assets_docs_dict = {}
         self.golden_tb_path: str | None = None
         self.golden_rtl_blackbox_path: str | None = None
         self.tb_gen: TBGenerator | None = None
@@ -39,6 +46,47 @@ class TopAgent:
         self.sim_reviewer: SimReviewer | None = None
         self.sim_judge: SimJudge | None = None
         self.rtl_edit: RTLEditor | None = None
+        self.style_reviewer: StyleReviewer | None = None
+        self.lint_reviewer: LintReviewer | None = None
+
+    def prepare_documents(self) -> None:
+        """Parse or load documents from assets/ subdirectories and store them as JSON."""
+        os.makedirs(self.assets_docs_path, exist_ok=True)
+
+        for assets_subdir in os.listdir(self.assets_path):
+            assets_subdir_path = os.path.join(self.assets_path, assets_subdir)
+            if not os.path.isdir(assets_subdir_path):
+                continue  # skip files, only handle subdirectories
+
+            # json filename for this subdir
+            assets_subdir_json_path = os.path.join(
+                self.assets_docs_path, f"{assets_subdir}.json"
+            )
+
+            docs_mgr = DocumentManager(
+                paths=CorpusPaths(docs_dir=assets_subdir_path),
+                parser_cfg=ParserConfig(parser_type="docling"),
+                docs_exts=[".pdf", ".pptx", ".ppt", ".md", ".docx", ".html"],
+            )
+
+            if not os.path.exists(assets_subdir_json_path):
+                logger.info(f"TopAgent Parsing documents from {assets_subdir_path}")
+                docs = docs_mgr.parse_all_files_in(assets_subdir_path)
+                docs_mgr.save_documents(docs, assets_subdir_json_path)
+            else:
+                logger.info(
+                    f"TopAgent Loading cached documents from {assets_subdir_json_path}"
+                )
+                docs = docs_mgr.load_documents(assets_subdir_json_path)
+
+            # store in dict
+            self.assets_docs_dict[assets_subdir] = docs or []
+
+            # log summary
+            logger.info(
+                f"TopAgent Prepared {len(self.assets_docs_dict[assets_subdir])} documents "
+                f"for assets subdirectory '{assets_subdir}'"
+            )
 
     def set_output_path(self, output_path: str) -> None:
         self.output_path = output_path
@@ -207,6 +255,125 @@ class TopAgent:
         if not is_sim_pass:  # Run if keep failing before last try
             is_sim_pass, _, _ = self.sim_reviewer.review()
 
+        # policy/consistency check vs style guide (based on descriptive rules)
+        if is_sim_pass and self.style_reviewer is not None:
+            logger.info(
+                "[StyleReviewer] Starting style-only pass on working design and TB."
+            )
+            original_rtl = rtl_code
+            original_tb = testbench
+
+            styled_rtl, styled_tb, style_summary, style_reason = (
+                self.style_reviewer.review(
+                    rtl_code=rtl_code,
+                    tb_code=testbench,
+                    enable_cache=True,
+                )
+            )
+
+            # Write styled sources
+            self.write_output(styled_rtl, "rtl.sv")
+            self.write_output(styled_tb, "tb.sv")
+
+            # Re-run sim to ensure no behavior change
+            style_sim_pass, _, style_sim_log = self.sim_reviewer.review()
+            if style_sim_pass:
+                logger.info("[StyleReviewer] Simulation PASSED after styling.")
+                rtl_code = styled_rtl
+                testbench = styled_tb
+                # Optionally persist a summary
+                try:
+                    with open(
+                        f"{self.output_dir_per_run}/style_changes.json", "w"
+                    ) as f:
+                        json.dump(
+                            {
+                                "reasoning": style_reason,
+                                "change_summary": style_summary,
+                            },
+                            f,
+                            indent=2,
+                        )
+                except Exception:
+                    pass
+            else:
+                logger.warning(
+                    "[StyleReviewer] Simulation FAILED after styling. Reverting to originals."
+                )
+                # Revert files to originals
+                self.write_output(original_rtl, "rtl.sv")
+                self.write_output(original_tb, "tb.sv")
+                # Ensure sim still passes with originals (it should)
+                _ = self.sim_reviewer.review()
+
+        # rule-driven lint/formatting
+        if is_sim_pass and self.lint_reviewer is not None:
+            logger.info(
+                "[LintReviewer] Starting format+lint pass on working design and TB."
+            )
+            # Read current (potentially styled) files as input to lint reviewer
+            with open(f"{self.output_dir_per_run}/rtl.sv", "r") as f:
+                lr_in_rtl = f.read()
+            with open(f"{self.output_dir_per_run}/tb.sv", "r") as f:
+                lr_in_tb = f.read()
+
+            (
+                final_rtl,
+                final_tb,
+                lint_ok,
+                lint_log,
+                fmt_log,
+                lint_changes,
+                lint_reason,
+            ) = self.lint_reviewer.review(
+                rtl_code=lr_in_rtl,
+                tb_code=lr_in_tb,
+                output_dir_per_run=self.output_dir_per_run,
+                rtl_filename="rtl.sv",
+                tb_filename="tb.sv",
+                enable_llm_fix=True,
+            )
+
+            # Re-run sim to ensure no behavior change post-lint/format
+            lint_sim_pass, _, lint_sim_log = self.sim_reviewer.review()
+            if lint_sim_pass:
+                logger.info("[LintReviewer] Simulation PASSED after format+lint.")
+                rtl_code = final_rtl
+                testbench = final_tb
+                # Save logs/summaries
+                try:
+                    with open(f"{self.output_dir_per_run}/lint_changes.json", "w") as f:
+                        json.dump(
+                            {
+                                "reasoning": lint_reason,
+                                "change_summary": lint_changes,
+                                "lint_passed": bool(lint_ok),
+                                "lint_log": (
+                                    json.loads(lint_log)
+                                    if isinstance(lint_log, str)
+                                    else str(lint_log)
+                                ),
+                                "format_log": (
+                                    json.loads(fmt_log)
+                                    if isinstance(fmt_log, str)
+                                    else str(fmt_log)
+                                ),
+                            },
+                            f,
+                            indent=2,
+                        )
+                except Exception:
+                    pass
+            else:
+                logger.warning(
+                    "[LintReviewer] Simulation FAILED after format+lint. Reverting to pre-lint sources."
+                )
+                # Revert to pre-lint (the versions already on disk before LintReviewer started)
+                self.write_output(lr_in_rtl, "rtl.sv")
+                self.write_output(lr_in_tb, "tb.sv")
+                # Sanity: re-run sim to confirm ok
+                _ = self.sim_reviewer.review()
+
         return is_sim_pass, rtl_code
 
     def run_instance_ablation(self, spec: str) -> Tuple[bool, str]:
@@ -231,6 +398,14 @@ class TopAgent:
         try:
             if os.path.exists(f"{self.output_dir_per_run}/properly_finished.tag"):
                 os.remove(f"{self.output_dir_per_run}/properly_finished.tag")
+
+            # prepare documents for rag for all the agents
+            self.prepare_documents()
+            print(self.assets_docs_dict.keys())
+            for subdir, docs in self.assets_docs_dict.items():
+                print(f"Subdir: {subdir}, Docs: {len(docs)}")
+
+            # initialize all the agents
             self.token_counter.reset()
             self.sim_reviewer = SimReviewer(
                 self.output_dir_per_run,
@@ -242,6 +417,39 @@ class TopAgent:
             self.rtl_edit = RTLEditor(
                 self.token_counter, sim_reviewer=self.sim_reviewer
             )
+            self.style_reviewer = StyleReviewer(self.token_counter)
+            self.lint_reviewer = LintReviewer(self.token_counter)
+
+            # tune docs for rag based on the agent. Key idea is that not all
+            # the agents need the same knowledge (divide et impera)
+            language_docs = self.assets_docs_dict.get("language", [])
+            style_docs = self.assets_docs_dict.get("style_guide", [])
+            tb_gen_docs = list(language_docs)
+            rtl_gen_docs = list(language_docs)
+            style_reviewer_docs = list(style_docs)
+
+            # init rag for agents
+            self.tb_gen.init_rag(
+                persist_dir="./.vector_storage/tb_gen",
+                faiss_path="./.faiss_storage/tb_gen_faiss.bin",
+                docs=tb_gen_docs,
+            )
+
+            self.rtl_gen.init_rag(
+                persist_dir="./.vector_storage/rtl_gen",
+                faiss_path="./.faiss_storage/rtl_gen_faiss.bin",
+                docs=rtl_gen_docs,
+            )
+
+            self.style_reviewer.init_rag(
+                persist_dir="./.vector_storage/style_reviewer",
+                faiss_path="./.faiss_storage/style_reviewer_faiss.bin",
+                docs=style_reviewer_docs,
+            )
+
+            # configure lint reviewer (rules/waivers/format width)
+            self.lint_reviewer.set_lint_autofix(mode="inplace")
+
             ret = (
                 self.run_instance(spec)
                 if not self.is_ablation

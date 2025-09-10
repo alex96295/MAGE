@@ -1,12 +1,16 @@
 import asyncio
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import tiktoken
 from anthropic.types import Usage
+from llama_index.core import Document
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse
+from llama_index.core.chat_engine import ContextChatEngine
 from llama_index.core.llms.llm import LLM
+from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.llms.anthropic import Anthropic
+from llama_index.llms.fireworks import Fireworks
 from llama_index.llms.openai import OpenAI
 from llama_index.llms.vertex import Vertex
 from pydantic import BaseModel
@@ -14,6 +18,12 @@ from vertexai.preview.generative_models import GenerativeModel
 
 from .gen_config import get_exp_setting
 from .log_utils import get_logger
+from .rag import (
+    ChatEngineFactory,
+    ChatTemplates,
+    VectorIndexSettings,
+    create_vector_retriever_from_docs,
+)
 from .utils import reformat_json_string
 
 logger = get_logger(__name__)
@@ -93,6 +103,9 @@ TOKEN_COSTS = {
     "gpt-4o-2024-08-06": TokenCost(
         in_token_cost_per_token=2.5 / 1000000, out_token_cost_per_token=10.0 / 1000000
     ),
+    "gpt-5-mini": TokenCost(
+        in_token_cost_per_token=0.25 / 1000000, out_token_cost_per_token=2.0 / 1000000
+    ),
     "o1-preview-2024-09-12": TokenCost(
         in_token_cost_per_token=15.0 / 1000000, out_token_cost_per_token=60.0 / 1000000
     ),
@@ -121,6 +134,7 @@ class TokenCounter:
         self.cur_tag = ""
         self.max_parallel_requests: int = 10
         self.enable_reformat_json = isinstance(llm, Vertex)
+        self.rag_chat_engine: Optional[ContextChatEngine] = None
         model = llm.metadata.model_name
         if isinstance(llm, OpenAI):
             self.encoding = tiktoken.encoding_for_model(model)
@@ -142,6 +156,16 @@ class TokenCounter:
 
             self.encoding = VertexEncoding(llm._client)
             self.activate_structure_output = True
+        elif isinstance(llm, Fireworks):
+            # Fireworks exposes an OpenAI-compatible API. For counting inside LlamaIndex,
+            # use cl100k_base (LlamaIndex's default global tokenizer) as a reasonable default.
+            try:
+                # If someone passes a Fireworks model whose name is recognized by tiktoken
+                # (rare), this will pick the closest mapping; otherwise fall back.
+                self.encoding = tiktoken.encoding_for_model(model)
+            except Exception:
+                self.encoding = tiktoken.get_encoding("cl100k_base")
+            logger.info(f"Using tokenizer 'cl100k_base' for Fireworks model '{model}'")
         else:
             logger.warning(
                 f"Cannot find tokenizer for model '{model}'. "
@@ -173,18 +197,67 @@ class TokenCounter:
     def reset(self) -> None:
         self.token_cnts = {"": []}
 
+    def init_rag(
+        self,
+        persist_dir: str = "./.vector_storage/tb_gen",
+        faiss_path: str = "./.faiss_storage/tb_gen_faiss.bin",
+        top_k: int = 2,
+        make_chat_engine: bool = True,
+        memory_token_limit: int = 1500,
+        templates: Optional[ChatTemplates] = None,
+        docs: Optional[Sequence[Document]] = None,
+    ) -> Optional[ContextChatEngine]:
+        """
+        Build/load a vector index from assets_docs_dict['language'] and
+        assets_docs_dict['style_guide'], create a retriever, and optionally a chat engine.
+        """
+
+        if not docs:
+            logger.error(
+                "init_rag(): No documents found. " "Vector index will not be created."
+            )
+            return
+
+        settings = VectorIndexSettings(
+            persist_dir=persist_dir,
+            faiss_path=faiss_path,
+            embedding_dim=None,
+        )
+        _, retriever = create_vector_retriever_from_docs(
+            documents=docs,
+            v_settings=settings,
+            top_k=top_k,
+        )
+
+        memory = ChatMemoryBuffer.from_defaults(token_limit=memory_token_limit)
+        self.rag_chat_engine = ChatEngineFactory.text_engine(
+            retriever=retriever,
+            llm=self.llm,
+            memory=memory,
+            templates=templates,
+        )
+
+        return self.rag_chat_engine
+
     def count_chat(
-        self, messages: List[ChatMessage], llm: LLM | None = None
+        self,
+        messages: List[ChatMessage],
+        llm: LLM | None = None,
+        rag_chat_engine: Optional[ContextChatEngine] = None,
     ) -> Tuple[ChatResponse, TokenCount]:
         llm = llm or self.llm
+        rag_chat_engine = rag_chat_engine or self.rag_chat_engine
         in_token_cnt = self.count(llm.messages_to_prompt(messages))
         logger.info(
             "TokenCounter count_chat Triggered at temp: %s, top_p: %s"
             % (settings.temperature, settings.top_p)
         )
-        response = llm.chat(
-            messages, top_p=settings.top_p, temperature=settings.temperature
-        )
+        if rag_chat_engine is not None:
+            response = rag_chat_engine.chat(messages)
+        else:
+            response = llm.chat(
+                messages, top_p=settings.top_p, temperature=settings.temperature
+            )
         out_token_cnt = self.count(response.message.content)
         token_cnt = TokenCount(in_token_cnt=in_token_cnt, out_token_cnt=out_token_cnt)
         self.token_cnts[self.cur_tag].append(token_cnt)

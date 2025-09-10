@@ -2,8 +2,11 @@ import os
 
 import config
 from google.oauth2 import service_account
+from llama_index.core import Settings
 from llama_index.core.llms.llm import LLM
 from llama_index.llms.anthropic import Anthropic
+from llama_index.llms.fireworks import Fireworks
+from llama_index.llms.ollama import Ollama
 from llama_index.llms.openai import OpenAI
 from llama_index.llms.vertex import Vertex
 from pydantic import BaseModel
@@ -40,7 +43,7 @@ def get_llm(**kwargs) -> LLM:
     cfg = Config(kwargs["cfg_path"])
     provider: str = kwargs["provider"]
     provider = provider.lower()
-    if provider == "anthropic":
+    if kwargs["provider"] == "anthropic":
         try:
             llm: LLM = Anthropic(
                 model=kwargs["model"],
@@ -103,11 +106,33 @@ def get_llm(**kwargs) -> LLM:
 
         except Exception as e:
             raise Exception(f"gen_config: Failed to get {provider} LLM") from e
+    elif kwargs["provider"] == "ollama":
+        try:
+            Settings.llm = Ollama(
+                model=kwargs["model"],
+                request_timeout=14400.0,
+                temperature=kwargs["temperature"],
+                context_window=8192,
+                additional_kwargs={"num_thread": 32},
+            )
+            llm: LLM = Settings.llm
+        except Exception as e:
+            raise Exception(f"gen_config: Failed to get {provider} LLM") from e
+    elif kwargs["provider"] == "fireworks":
+        try:
+            llm: LLM = Fireworks(
+                model=kwargs["model"],
+                api_key=cfg["FIREWORKS_API_KEY"],
+                max_tokens=kwargs["max_token"],
+            )
+        except Exception as e:
+            raise Exception(f"gen_config: Failed to get {provider} LLM") from e
     else:
         raise ValueError(f"gen_config: Invalid provider: {provider}")
 
     try:
-        _ = llm.complete("Say 'Hi'")
+        resp = llm.complete("Say 'Hi Ale'")
+        print(resp.text)
     except Exception as e:
         raise Exception(
             f"gen_config: Failed to complete LLM chat for {provider}"

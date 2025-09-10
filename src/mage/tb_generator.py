@@ -1,19 +1,34 @@
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from llama_index.core import Document
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
+from llama_index.core.chat_engine import ContextChatEngine
 from pydantic import BaseModel
 
 from .log_utils import get_logger
-from .prompts import FAILED_TRIAL_PROMPT, ORDER_PROMPT, TB_4_SHOT_EXAMPLES
+from .prompts import (
+    FAILED_TRIAL_PROMPT,
+    ORDER_PROMPT,
+    SV_LANGUAGE_DIRECTIVES_PROMPT,
+    TB_4_SHOT_EXAMPLES,
+)
 from .token_counter import TokenCounter, TokenCounterCached
 from .utils import add_lineno
 
 logger = get_logger(__name__)
 
 SYSTEM_PROMPT = r"""
-You are an expert in SystemVerilog design.
-You can always write SystemVerilog code with no syntax errors and always reach correct functionality.
+You are an expert in RTL design.
+You can always write SystemVerilog code with
+no syntax errors and always reach correct functionality.
+
+All generated SystemVerilog code must strictly conform to the IEEE 1800-2017
+SystemVerilog Language Reference Manual (LRM) and follow the best practices
+described in "Verilog and SystemVerilog Gotchas: 101 Common Coding Errors and
+How to Avoid Them", by Stuart Sutherland and Don Mills.
+
+{sv_language_directives_prompt}
 """
 
 NON_GOLDEN_TB_PROMPT = r"""
@@ -205,9 +220,37 @@ class TBGenerator:
         self.golden_tb_path: str | None = None
         self.json_decode_max_trial = 3
         self.gen_display_queue = True
+        self.rag_chat_engine: Optional[ContextChatEngine] = None
 
     def reset(self):
         self.history = []
+
+    def init_rag(
+        self,
+        persist_dir: str = "./.vector_storage/tb_gen",
+        faiss_path: str = "./.faiss_storage/tb_gen_faiss.bin",
+        docs: Sequence[Document] = None,
+    ) -> None:
+        """
+        Build/load a vector index from docs, create a retriever and a chat engine.
+        """
+
+        if not docs:
+            logger.error(
+                "TBGenerator No documents found to init RAG. "
+                "Vector index will not be created."
+            )
+            return
+
+        self.rag_chat_engine = self.token_counter.init_rag(
+            persist_dir=persist_dir,
+            faiss_path=faiss_path,
+            top_k=2,
+            memory_token_limit=1500,
+            docs=docs,
+        )
+
+        logger.info("TBGenerator RAG initialized.")
 
     def set_golden_tb_path(self, golden_tb_path: str | None) -> None:
         self.golden_tb_path = golden_tb_path
@@ -226,7 +269,7 @@ class TBGenerator:
 
     def generate(self, messages: List[ChatMessage]) -> ChatResponse:
         logger.info(f"TB generator input message: {messages}")
-        resp, token_cnt = self.token_counter.count_chat(messages)
+        resp, token_cnt = self.token_counter.count_chat(messages, self.rag_chat_engine)
         logger.info(f"Token count: {token_cnt}")
         logger.info(f"{resp.message.content}")
         return resp
@@ -250,7 +293,12 @@ class TBGenerator:
                 display_prompt=display_prompt,
             )
         ret = [
-            ChatMessage(content=SYSTEM_PROMPT, role=MessageRole.SYSTEM),
+            ChatMessage(
+                content=SYSTEM_PROMPT.format(
+                    sv_language_directives_prompt=SV_LANGUAGE_DIRECTIVES_PROMPT
+                ),
+                role=MessageRole.SYSTEM,
+            ),
             ChatMessage(content=generation_content, role=MessageRole.USER),
         ]
         if self.failed_trial:

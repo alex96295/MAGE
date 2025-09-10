@@ -5,9 +5,10 @@ from typing import Any, Dict, List, Tuple
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
 from pydantic import BaseModel
 
+from .compile_reviewer import compile_slang
 from .log_utils import get_logger
-from .prompts import ORDER_PROMPT
-from .sim_reviewer import SimReviewer, check_syntax
+from .prompts import ORDER_PROMPT, SV_LANGUAGE_DIRECTIVES_PROMPT
+from .sim_reviewer import SimReviewer, check_syntax_iverilog
 from .token_counter import TokenCounter, TokenCounterCached
 
 logger = get_logger(__name__)
@@ -20,6 +21,14 @@ The actions below are available:
 <actions>
 {actions}
 </actions>
+
+You can always write SystemVerilog code with no syntax errors and always reach
+correct functionality. All generated SystemVerilog code must strictly conform
+to the IEEE 1800-2017 SystemVerilog Language Reference Manual (LRM) and follow
+the best practices described in "Verilog and SystemVerilog Gotchas: 101 Common
+Coding Errors and How to Avoid Them", by Stuart Sutherland and Don Mills.
+
+{sv_language_directives_prompt}
 """
 
 ACTION_PROMPT = r"""
@@ -143,19 +152,30 @@ class RTLEditor:
             return f.read()
 
     def replace_sanity_check(self) -> Dict[str, Any]:
-        # Run syntax check and simulation check sequentially
-        is_syntax_pass, syntax_output = check_syntax(self.rtl_path)
-        if is_syntax_pass:
-            syntax_output = "Syntax check passed."
-        if not is_syntax_pass:
+        # Run dual syntax checks: slang (parse+elab) AND iverilog (parse)
+        slang_ok, slang_out = compile_slang(self.rtl_path, mode="elab")
+        iver_ok, iver_out = check_syntax_iverilog(self.rtl_path)
+
+        if slang_ok and iver_ok:
+            syntax_output = "Syntax checks passed (slang + iverilog)."
+        else:
+            # Aggregate diagnostics so upstream fixer can address all issues in one go
+            syntax_output = (
+                "==== slang (syntax/elaboration) ====\n"
+                f"{slang_out}\n\n"
+                "==== iverilog (syntax) ====\n"
+                f"{iver_out}\n"
+            )
             return {
                 "is_syntax_pass": False,
                 "is_sim_pass": False,
                 "error_msg": syntax_output,
                 "sim_mismatch_cnt": 0,
             }
+
         is_sim_pass, sim_mismatch_cnt, sim_output = self.sim_reviewer.review()
         assert isinstance(sim_mismatch_cnt, int)
+
         return {
             "is_syntax_pass": True,
             "is_sim_pass": is_sim_pass,
@@ -309,7 +329,8 @@ class RTLEditor:
     def get_init_prompt_messages(self) -> List[ChatMessage]:
         actions = [self.replace_content_by_matching]
         actions_prompt = SYSTEM_PROMPT.format(
-            actions="".join([self.gen_action_prompt(action) for action in actions])
+            actions="".join([self.gen_action_prompt(action) for action in actions]),
+            sv_language_directives_prompt=SV_LANGUAGE_DIRECTIVES_PROMPT,
         )
         system_prompt = ChatMessage(content=actions_prompt, role=MessageRole.SYSTEM)
         with open(self.tb_path, "r") as f:

@@ -16,10 +16,17 @@ dependencies = [
   "llama-index-llms-anthropic",
   "llama-index-llms-openai",
   "llama-index-llms-vertex",
+  "llama-index-llms-ollama",
+  "llama-index-llms-fireworks",
+  "llama-index-retrievers-bm25",
+  "llama-index-vector-stores-faiss",
+  "llama-index-graph-stores-neo4j",
+  "llama-index-legacy",
   "pre-commit",
   "pydantic",
   "rich",
-  "tiktoken"
+  "tiktoken",
+  "ollama"
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",

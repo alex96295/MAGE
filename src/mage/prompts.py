@@ -623,3 +623,79 @@ So, please STRICTLY FOLLOW the output format given as XML tag content below to g
 </output_format>
 DO NOT include any other information in your response, like 'json', 'reasoning' or '<output_format>'.
 """
+
+SV_LANGUAGE_DIRECTIVES_PROMPT = r"""
+Key coding requirements (RTL + Testbench):
+
+1. **Declarations & Types**
+   - All signals, variables, parameters, and localparams must be explicitly declared
+     before use. No implicit nets are allowed.
+   - Always specify signal types (`logic`, `wire`, `bit`, `int`, `enum`, `struct`, etc.)
+     and widths explicitly; avoid relying on default widths.
+   - Use `logic` for most RTL signals instead of `reg`/`wire` unless multiple drivers
+     require `wire`.
+   - Parameterization must be consistent, synthesizable, and avoid accidental width truncation.
+
+2. **Procedural Blocks**
+   - Use `always_ff` for sequential (clocked) logic, with **non-blocking assignments (`<=`) only**.
+   - Use `always_comb` for combinational logic, with **blocking assignments (`=` only)**.
+   - Do not mix blocking and non-blocking assignments in the same always block.
+   - Never use incomplete sensitivity lists; prefer `always_comb` instead of `always @(*)`.
+
+3. **Reset & Initialization**
+   - Explicitly handle reset behavior (synchronous or asynchronous) for all sequential logic.
+   - Ensure registers have well-defined reset values; avoid relying on simulator initialization.
+   - For asynchronous resets, use the proper sensitivity list: `@(posedge clk or negedge rst_n)`.
+
+4. **Operators & Expressions**
+   - Distinguish between logical (`!`, `&&`, `||`) and bitwise (`~`, `&`, `|`, `^`) operators.
+   - Avoid width mismatches: always size constants (e.g., `8'd0` instead of `0`).
+   - Be explicit about signed vs unsigned arithmetic; cast where needed.
+   - Avoid unintended truncation or extension when assigning between different widths.
+
+5. **Coding Style & Lint Cleanliness**
+   - Do not infer latches: ensure all branches of `if`/`case` assign outputs in combinational blocks.
+   - Use `unique case` / `priority case` when appropriate; always provide a default branch.
+   - Avoid multiple drivers on the same signal unless explicitly using resolved nets (`wire`).
+   - No delays (`#`), force/release, or event controls in synthesizable RTL.
+   - All registers and state elements must be **initialized through reset logic** (synchronous or asynchronous),
+     not via `initial` blocks. Simulation-only initializations are allowed in testbenches, not in synthesizable RTL.
+
+6. **Synthesizability**
+   - Only use constructs guaranteed synthesizable: avoid dynamic arrays, classes, mailboxes, queues, and randomization in RTL.
+   - Keep loops static and bounded for synthesis (e.g., `for` with fixed iteration counts).
+   - Generate blocks must be fully elaboratable at compile time.
+
+7. **Testbenches (TB-only)**
+   - Use `$display`, `$monitor`, `$fatal`, `$finish`, and randomization constructs only in testbenches.
+   - Testbenches must generate a deterministic clock and reset sequence.
+   - Drive DUT inputs deterministically and check outputs using assertions or explicit checks.
+   - Use `initial` blocks only in TB, never in synthesizable RTL.
+
+8. **Assertions & Coverage**
+   - Use SystemVerilog Assertions (SVA) in testbenches or formal verification, not inside RTL datapath.
+   - Functional coverage (`covergroup`, `coverpoint`) belongs in TB, not RTL.
+
+9. **Code Quality & Maintainability**
+   - Use descriptive names for signals and parameters; avoid magic numbersprefer parameters/localparams.
+   - Modularize designs: keep parameterized, reusable RTL modules separate from TB code.
+   - Write code that is both simulation-correct and synthesizer-friendly (no race conditions, deterministic reset/startup).
+   - RTL must be free of race conditions between testbench and DUT (avoid unsynchronized stimulus).
+
+10. **Common Pitfalls to Avoid (from Gotchas 101)**
+    - Do not rely on default 1-bit nets (undeclared identifiers).
+    - Avoid accidental latch inference from incomplete `if` or `case` or uninitialized signals.
+    - Never drive the same variable from multiple always blocks.
+    - Don't confuse `=` vs `<=` in clocked processes.
+    - Avoid mixing blocking/non-blocking in same block.
+    - Be explicit about blocking vs non-blocking assignments in TB to avoid race conditions.
+    - Do not use non-constant expressions in generate-for loop bounds.
+    - Be careful with non-determinism in simulation vs synthesis (e.g., `x`, `z` propagation).
+
+Summary:
+- RTL must be synthesizable, deterministic, and free from race conditions, latches,
+  width mismatches, or undeclared identifiers.
+- TBs must drive DUT deterministically and separate TB-only constructs from RTL.
+- All code must be IEEE 1800-2017 compliant and pass linting against common RTL coding rules.
+
+"""
