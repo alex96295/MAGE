@@ -2,6 +2,7 @@
 import json
 from typing import List, Optional, Sequence, Tuple
 
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
 from llama_index.core.chat_engine import ContextChatEngine
 from pydantic import BaseModel
@@ -146,6 +147,7 @@ class StyleReviewer:
         persist_dir: str = "./.vector_storage/style_reviewer",
         faiss_path: str = "./.faiss_storage/style_reviewer_faiss.bin",
         docs: Optional[Sequence] = None,
+        embed_model: BaseEmbedding = None,
     ) -> None:
         """
         Build/load a vector index from docs and create a retriever/chat engine.
@@ -165,6 +167,7 @@ class StyleReviewer:
             top_k=2,
             memory_token_limit=1500,
             docs=docs,
+            embed_model=embed_model,
         )
         logger.info("StyleReviewer RAG initialized.")
 

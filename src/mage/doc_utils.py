@@ -40,6 +40,11 @@ except Exception:
     _HAVE_LLAMA_PARSE = False
 
 try:
+    from docling.datamodel.pipeline_options import (
+        AcceleratorDevice,
+        AcceleratorOptions,
+        PdfPipelineOptions,
+    )
     from llama_index.readers.docling import DoclingReader
 
     _HAVE_DOCLING = True
@@ -54,9 +59,11 @@ class ParserConfig:
     """
     Configuration for document parsing.
     parser_type: "llamaparse" or "docling".
+    use_gpu: whether to allow GPU usage (only applies to docling).
     """
 
     parser_type: str = "docling"  # default to docling
+    use_gpu: bool = True  # default is to use GPU if available
 
 
 @dataclass
@@ -125,7 +132,9 @@ class DocumentManager:
             file_extractor=self._file_extractor,
             exclude_hidden=False,
         )
-        docs: List[Document] = reader.load_data(show_progress=True, num_workers=num_workers)  # type: ignore
+        docs: List[Document] = reader.load_data(
+            show_progress=True, num_workers=num_workers
+        )  # type: ignore
         return docs
 
     def save_documents(self, documents: Sequence[Document], filename: str) -> None:
@@ -159,7 +168,9 @@ class DocumentManager:
             text = item.get("text", "")
             doc_id = item.get("doc_id")
             metadata = item.get("metadata", {}) or {}
-            docs.append(Document(text=text, doc_id=doc_id, metadata=metadata))  # type: ignore
+            docs.append(
+                Document(text=text, doc_id=doc_id, metadata=metadata)
+            )  # type: ignore
         logger.info(f"Loaded {len(docs)} documents from {filename}.")
         return docs
 
@@ -202,7 +213,21 @@ class DocumentManager:
                 raise RuntimeError(
                     "docling reader not installed. pip install llama-index-readers-docling"
                 )
-            self._parser = DoclingReader(export_type=DoclingReader.ExportType.JSON)
+
+            # Configure accelerator options depending on GPU usage flag
+            if self.parser_cfg.use_gpu:
+                accel_opts = AcceleratorOptions(device=AcceleratorDevice.GPU)
+                logger.info("DoclingReader will use GPU.")
+            else:
+                accel_opts = AcceleratorOptions(device=AcceleratorDevice.CPU)
+                logger.info("DoclingReader forced to use CPU only (no GPU).")
+
+            pipeline_opts = PdfPipelineOptions(accelerator_options=accel_opts)
+
+            self._parser = DoclingReader(
+                export_type=DoclingReader.ExportType.JSON,
+                pipeline_options=pipeline_opts,
+            )
             logger.info("Using DoclingReader as parser.")
         else:
             raise ValueError(

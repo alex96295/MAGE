@@ -2,7 +2,7 @@
 set -e
 
 # Output folder
-OUTDIR="language"
+OUTDIR="assets/language"
 mkdir -p "$OUTDIR"
 
 # URLs (direct HTTP links, not chrome-extension)

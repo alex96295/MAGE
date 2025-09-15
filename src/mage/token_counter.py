@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import tiktoken
 from anthropic.types import Usage
 from llama_index.core import Document
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse
 from llama_index.core.chat_engine import ContextChatEngine
 from llama_index.core.llms.llm import LLM
@@ -206,6 +207,7 @@ class TokenCounter:
         memory_token_limit: int = 1500,
         templates: Optional[ChatTemplates] = None,
         docs: Optional[Sequence[Document]] = None,
+        embed_model: Optional[BaseEmbedding] = None,
     ) -> Optional[ContextChatEngine]:
         """
         Build/load a vector index from assets_docs_dict['language'] and
@@ -214,20 +216,27 @@ class TokenCounter:
 
         if not docs:
             logger.error(
-                "init_rag(): No documents found. " "Vector index will not be created."
+                "TokenCounter init_rag(): No documents found. "
+                "Vector index will not be created."
             )
             return
 
+        logger.info("TokenCounter Setting up vector index settings")
         settings = VectorIndexSettings(
             persist_dir=persist_dir,
             faiss_path=faiss_path,
-            embedding_dim=None,
+            embedding_dim=1024,
+            embed_model=embed_model,
         )
+
+        logger.info("TokenCounter Building or loading vector store and index")
         _, retriever = create_vector_retriever_from_docs(
             documents=docs,
             v_settings=settings,
             top_k=top_k,
         )
+
+        logger.info(retriever)
 
         memory = ChatMemoryBuffer.from_defaults(token_limit=memory_token_limit)
         self.rag_chat_engine = ChatEngineFactory.text_engine(

@@ -2,6 +2,7 @@ import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from llama_index.core import Document
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
 from llama_index.core.chat_engine import ContextChatEngine
 from pydantic import BaseModel
@@ -230,6 +231,7 @@ class TBGenerator:
         persist_dir: str = "./.vector_storage/tb_gen",
         faiss_path: str = "./.faiss_storage/tb_gen_faiss.bin",
         docs: Sequence[Document] = None,
+        embed_model: BaseEmbedding = None,
     ) -> None:
         """
         Build/load a vector index from docs, create a retriever and a chat engine.
@@ -242,12 +244,14 @@ class TBGenerator:
             )
             return
 
+        logger.info("TBGenerator Creating RAG")
         self.rag_chat_engine = self.token_counter.init_rag(
             persist_dir=persist_dir,
             faiss_path=faiss_path,
             top_k=2,
             memory_token_limit=1500,
             docs=docs,
+            embed_model=embed_model,
         )
 
         logger.info("TBGenerator RAG initialized.")

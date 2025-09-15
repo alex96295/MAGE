@@ -5,6 +5,7 @@ import sys
 import traceback
 from typing import List, Tuple
 
+from llama_index.core.embeddings import resolve_embed_model
 from llama_index.core.llms import LLM
 
 from .doc_utils import CorpusPaths, DocumentManager, ParserConfig
@@ -24,6 +25,7 @@ logger = get_logger(__name__)
 class TopAgent:
     def __init__(self, llm: LLM):
         self.llm = llm
+        self.embed_model = resolve_embed_model("local:BAAI/bge-m3")
         self.token_counter = (
             TokenCounterCached(llm)
             if TokenCounterCached.is_cache_enabled(llm)
@@ -65,7 +67,7 @@ class TopAgent:
 
             docs_mgr = DocumentManager(
                 paths=CorpusPaths(docs_dir=assets_subdir_path),
-                parser_cfg=ParserConfig(parser_type="docling"),
+                parser_cfg=ParserConfig(parser_type="docling", use_gpu=False),
                 docs_exts=[".pdf", ".pptx", ".ppt", ".md", ".docx", ".html"],
             )
 
@@ -401,9 +403,9 @@ class TopAgent:
 
             # prepare documents for rag for all the agents
             self.prepare_documents()
-            print(self.assets_docs_dict.keys())
+            logger.info(self.assets_docs_dict.keys())
             for subdir, docs in self.assets_docs_dict.items():
-                print(f"Subdir: {subdir}, Docs: {len(docs)}")
+                logger.info(f"Subdir: {subdir}, Docs: {len(docs)}")
 
             # initialize all the agents
             self.token_counter.reset()
@@ -433,18 +435,21 @@ class TopAgent:
                 persist_dir="./.vector_storage/tb_gen",
                 faiss_path="./.faiss_storage/tb_gen_faiss.bin",
                 docs=tb_gen_docs,
+                embed_model=self.embed_model,
             )
 
             self.rtl_gen.init_rag(
                 persist_dir="./.vector_storage/rtl_gen",
                 faiss_path="./.faiss_storage/rtl_gen_faiss.bin",
                 docs=rtl_gen_docs,
+                embed_model=self.embed_model,
             )
 
             self.style_reviewer.init_rag(
                 persist_dir="./.vector_storage/style_reviewer",
                 faiss_path="./.faiss_storage/style_reviewer_faiss.bin",
                 docs=style_reviewer_docs,
+                embed_model=self.embed_model,
             )
 
             # configure lint reviewer (rules/waivers/format width)

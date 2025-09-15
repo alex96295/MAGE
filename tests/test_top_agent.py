@@ -20,17 +20,17 @@ from mage.token_counter import TokenCount
 logger = get_logger(__name__)
 
 args_dict = {
-    "provider": "openai",
+    # "provider": "openai",
     # "provider": "fireworks",
-    # "provider": "ollama",
+    "provider": "ollama",
     # "model": "claude-3-7-sonnet@20250219",
     # "model": "deepseek-coder-v2:16b",
-    # "model": "llama3.1:8b",
+    "model": "llama3.2:latest",
     # "model": "gpt-oss:20b",
     # "model": "deepseek-r1:14b",
     # "model": "gemini-2.0-flash-001",
     # "model": "claude-3-7-sonnet-20250219",
-    "model": "gpt-4o-2024-08-06",
+    # "model": "gpt-4o-2024-08-06",
     # "model": "gpt-5-mini",
     # "filter_instance": "^(Prob070_ece241_2013_q2|Prob151_review2015_fsm)$",
     "filter_instance": "^(Prob011_norgate)$",

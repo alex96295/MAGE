@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
+import faiss
 from llama_index.core import (
     Document,
     PropertyGraphIndex,
@@ -12,6 +13,7 @@ from llama_index.core import (
     VectorStoreIndex,
     load_index_from_storage,
 )
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.chat_engine import ContextChatEngine
 from llama_index.core.indices.property_graph import VectorContextRetriever
 from llama_index.core.llms.llm import LLM
@@ -22,9 +24,11 @@ from llama_index.core.retrievers import BaseRetriever, QueryFusionRetriever
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.legacy.indices.knowledge_graph.retrievers import KGRetrieverMode
 from llama_index.retrievers.bm25 import BM25Retriever
-
-# Vector store (FAISS) swap for your own vector backend if needed
 from llama_index.vector_stores.faiss import FaissVectorStore
+
+from .log_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -32,11 +36,9 @@ class VectorIndexSettings:
     """Settings for a vector index."""
 
     persist_dir: str
-    faiss_path: Optional[str] = (
-        None  # path to persist FAISS index (e.g., ".faiss_storage/faiss_index.bin")
-    )
-    embedding_dim: Optional[int] = None  # only needed if creating FAISS from scratch
-    # You can add more knobs: faiss index type, metric, etc.
+    faiss_path: str = None
+    embedding_dim: int = 1024
+    embed_model: BaseEmbedding = None
 
 
 @dataclass
@@ -71,39 +73,44 @@ class VectorIndexManager:
         """Create a FAISS-backed index or load from disk if present."""
         # If a persisted index exists -> load it
         if self.settings.faiss_path and os.path.exists(self.settings.faiss_path):
+            logger.info("Loading existing persisted vector store and index")
             vector_store = FaissVectorStore.from_persist_path(self.settings.faiss_path)
             storage_context = StorageContext.from_defaults(
                 persist_dir=self.settings.persist_dir,
                 vector_store=vector_store,
             )
             index = load_index_from_storage(storage_context)
+            logger.info("Loaded existing FAISS vector index.")
             return index
 
         # Otherwise, build from documents
+        logger.info("No existing vector store/index found. Creating new one...")
         vector_store = None
-        if self.settings.embedding_dim is None:
-            # If you use FAISS manually, youd normally construct the faiss.Index
-            # and pass it to FaissVectorStore. For simplicity, let LlamaIndex
-            # create & manage it internally.
-            vector_store = FaissVectorStore()
-        else:
-            # You could construct a custom faiss.Index here if you want a specific metric.
-            vector_store = FaissVectorStore()
+        logger.info(faiss.__version__)
+        logger.info(faiss.get_compile_options())
+        faiss_index = faiss.IndexFlatIP(self.settings.embedding_dim)
+        logger.info("Debug")
+        logger.info(faiss_index)
+        vector_store = FaissVectorStore(faiss_index=faiss_index)
+        logger.info(vector_store)
 
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
         index = VectorStoreIndex.from_documents(
             list(documents),
             storage_context=storage_context,
-            embed_model=Settings.embed_model,
+            embed_model=self.settings.embed_model,
             show_progress=True,
             use_async=True,
         )
 
         # Persist both the storage and FAISS index (if path provided)
+        logger.info("Persisting newly created vector index")
+        vector_store.persist(persist_path=self.settings.faiss_path)
         index.storage_context.persist(persist_dir=self.settings.persist_dir)
-        if self.settings.faiss_path:
-            vector_store.persist(persist_path=self.settings.faiss_path)
+        logger.info(
+            f"Persisted FAISS vector index to {self.settings.faiss_path} and storage to {self.settings.persist_dir}."
+        )
         return index
 
 
