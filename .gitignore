@@ -12,3 +12,6 @@ data/
 *.vvp
 dist/
 build/
+.documents
+.faiss_storage
+.vector_storage

@@ -21,8 +21,13 @@ def stderr_all_lines_benign(stderr: str) -> bool:
     )
 
 
-def check_syntax_iverilog(rtl_path: str) -> Tuple[bool, str]:
-    cmd = f"oseda -2025.03 iverilog -t null -Wall -Winfloop -Wno-timescale -g2012 -o /dev/null {rtl_path}"
+def check_syntax(rtl_path: str, simulator: str) -> Tuple[bool, str]:
+    rtl_path_lib = os.path.join(os.path.dirname(rtl_path), "rtl_lib.sv")
+    match simulator:
+        case "iverilog":
+            cmd = f"oseda -2025.03 iverilog -t null -Wall -Winfloop -Wno-timescale -g2012 -o /dev/null {rtl_path_lib} {rtl_path}"
+        case "questa":
+            cmd = f"questa-2023.4 vlog {rtl_path_lib} {rtl_path} && questa-2023.4 vopt -permissive -suppress 3009 -suppress 8386 -error 7 +UVM_NO_RELNOTES -O5 TopTestbench -o TopTestbench_opt"
     is_pass, sim_output = run_bash_command(cmd, timeout=60)
     sim_output_obj = CommandResult.model_validate_json(sim_output)
     is_pass = (
@@ -48,19 +53,27 @@ def sim_review_mismatch_cnt(stdout: str) -> int:
 
 
 def sim_review(
+    simulator: str,
     output_path_per_run: str,
     golden_rtl_path: str | None = None,
 ) -> Tuple[bool, int, str]:
     rtl_path = f"{output_path_per_run}/rtl.sv"
+    rtl_path_lib = os.path.join(os.path.dirname(rtl_path), "rtl_lib.sv")
     vvp_name = f"{output_path_per_run}/sim_output.vvp"
     tb_path = f"{output_path_per_run}/tb.sv"
     if golden_rtl_path is None:
         golden_rtl_path = ""
     if os.path.isfile(vvp_name):
         os.remove(vvp_name)
-    cmd = "oseda -2025.03 iverilog -Wall -Winfloop -Wno-timescale -g2012 -o {} {} {} {}; oseda -2025.03 vvp -n {}".format(
-        vvp_name, tb_path, rtl_path, golden_rtl_path, vvp_name
-    )
+    match simulator:
+        case "iverilog":
+            cmd = "oseda -2025.03 iverilog -Wall -Winfloop -Wno-timescale -g2012 -o {} {} {} {} {}; oseda -2025.03 vvp -n {}".format(
+                vvp_name, tb_path, rtl_path_lib, rtl_path, golden_rtl_path, vvp_name
+            )
+        case "questa":
+            cmd = 'questa-2023.4 vlog {} {} {} {} && questa-2023.4 vopt -permissive -suppress 3009 -suppress 8386 -error 7 +UVM_NO_RELNOTES -O5 TopTestbench -o TopTestbench_opt && questa-2023.4 vsim -c TopTestbench_opt -t 1ps -suppress 3009 -suppress 8386 -error 7 -cpppath /usr/bin/g++ -do "run -all; quit -f"'.format(
+                rtl_path_lib, rtl_path, golden_rtl_path, tb_path
+            )
     is_pass, sim_output = run_bash_command(cmd, timeout=60)
     sim_output_obj = CommandResult.model_validate_json(sim_output)
     is_pass = (
@@ -88,8 +101,9 @@ class SimReviewer:
         self.output_path_per_run = output_path_per_run
         self.golden_rtl_path = golden_rtl_path
 
-    def review(self) -> Tuple[bool, int, str]:
+    def review(self, simulator: str) -> Tuple[bool, int, str]:
         return sim_review(
+            simulator,
             self.output_path_per_run,
             self.golden_rtl_path,
         )

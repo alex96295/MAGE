@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import time
 from datetime import timedelta
 from typing import Any, Dict
@@ -33,11 +34,13 @@ args_dict = {
     # "model": "gpt-4o-2024-08-06",
     # "model": "gpt-5-mini",
     # "filter_instance": "^(Prob070_ece241_2013_q2|Prob151_review2015_fsm)$",
-    "filter_instance": "^(Prob011_norgate)$",
+    "filter_instance": "^(Prob000_fifo_v3)$",
     # "filter_instance": "^(.*)$",
-    "type_benchmark": "verilog_eval_v2",
-    "path_benchmark": "./verilog-eval",
-    "run_identifier": "your_run_identifier",
+    # "type_benchmark": "verilog_eval_v2",
+    "type_benchmark": "pulp_verilog_eval",
+    # "path_benchmark": "./verilog-eval",
+    "path_benchmark": "./pulp-verilog-eval",
+    "run_identifier": "exp00",
     "n": 1,
     "temperature": 0.85,
     "top_p": 0.95,
@@ -68,6 +71,14 @@ def run_round(args: argparse.Namespace, llm: LLM):
         args.path_benchmark,
         args.filter_instance,
     )
+
+    print(spec_dict)
+
+    print(golden_tb_path_dict)
+
+    print(golden_rtl_path_dict)
+
+    os._exit(1)
 
     agent = TopAgent(llm)
     agent.set_output_path(f"./output_{args.run_identifier}")

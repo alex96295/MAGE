@@ -1,4 +1,5 @@
 import json
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from llama_index.core import Document
@@ -15,11 +16,12 @@ from .prompts import (
     RTL_4_SHOT_EXAMPLES,
     SV_LANGUAGE_DIRECTIVES_PROMPT,
 )
-from .sim_reviewer import check_syntax_iverilog
+from .sim_reviewer import check_syntax
 from .token_counter import TokenCounter, TokenCounterCached
-from .utils import add_lineno
+from .utils import _append_rtl_libs, _collect_rtl_libs, _safe_json_loads, add_lineno
 
 logger = get_logger(__name__)
+
 
 SYSTEM_PROMPT = r"""
 You are an expert in RTL design.
@@ -70,6 +72,9 @@ Other requirements:
 4. For combinational logic with an always block do not explicitly specify the sensitivity list; instead use always @(*).
 5. NEVER USE 'inside' operator in RTL code. Code like 'state inside {STATE_B, STATE_C, STATE_D}' should NOT be used.
 6. Never USE 'unique' or 'unique0' keywords in RTL code. Code like 'unique case' should NOT be used.
+7. When instantiating reused modules, match parameter names and port lists EXACTLY as in lib_consultant_json (names, directions, widths). Do not rename their ports or parameters.
+8. Output exactly one module: the primary design you are generating. Do not include reused module source; only instantiate them. The build will append their declarations.
+9. Important: if previous files included appended reused modules, ignore them as they will be re-appended by the build. Only modify the primary module, that is your focus.
 """
 # Some prompts above come from:
 # @misc{ho2024verilogcoderautonomousverilogcoding,
@@ -97,11 +102,13 @@ Another agent has generated a testbench regarding the given input_spec:
 """
 
 FORMAT_ERROR_PROMPT = r"""
-The error below has been reported by the format tool:
+The error below has been reported by the tools:
 <format_error>
 {format_error}
 </format_error>
-To understand the error message better, we offered a version of generated module with line number:
+
+Below is the current PRIMARY module with line numbers. (Reused library module declarations are appended automatically by the build; do not edit or duplicate them.)
+To understand the error message better, we offered a version of generated main module with line number:
 <module_with_lineno>
 {module_with_lineno}
 </module_with_lineno>
@@ -111,6 +118,49 @@ EXAMPLE_OUTPUT = {
     "reasoning": "All reasoning steps and advices to avoid syntax error",
     "module": "Pure SystemVerilog code, a complete module",
 }
+
+INTEGRATION_GUIDANCE_PROMPT = r"""
+You are given two structured inputs from an independent agent based on the
+input spec defined above for the module to be designed. These strctured inputs
+represent the reasoning of the independent agent in understanding the
+high-level building blocks (submodules) of the design, and the effective
+submodules present in the available RTL library.
+
+<planner_json>
+{planner_json}
+</planner_json>
+
+<lib_consultant_json>
+{lib_consultant_json}
+</lib_consultant_json>
+
+How to use them:
+1) Reuse candidates are under lib_consultant_json.reuse.*.library_json.
+   - Use the interface (parameters + ports) exactly as listed to INSTANTIATE those modules inside your new design.
+   - Do not alter reused module port names, directions, or parameter names.
+   - Define connetion signals with the right type and width for proper connection between the instantiated modules and the surrounding logic.
+2) Do not include the reused module source body in your own "module" output.
+   - The build system will append the correct reused module declarations/definitions after your new module.
+   - Your job: instantiate them correctly (parameters/ports, widths, resets, naming).
+3) If no confident match exists (library_json == null), implement the needed logic yourself.
+4) Prefer naming conventions / structure suggested by the planner_json when reasonable.
+5) If a preliminary interface is provided, it takes precedence over any other suggestion.
+6) Output only one complete SystemVerilog module for the requested design, not testbench code.
+
+When instantiating reused modules:
+- Map your top-level interface signals to the reused module ports clearly and consistently.
+- Declare any internal wires/regs (logic) needed to connect to those instances.
+- Avoid `unique/unique0`, avoid `inside`, and follow the rest of the RTL rules above.
+
+You will ONLY author the primary design module.
+Reused library modules are appended automatically by the build system.
+
+Rules:
+- Instantiate reused modules using the interface in <lib_consultant_json>.
+- Do NOT include reused module source bodies in your output.
+- If you are shown a previous file that contains the primary module PLUS appended reused module declarations, IGNORE those appended modules. ONLY modify and output the primary module.
+- Your response must contain exactly one complete SystemVerilog module: the primary design.
+"""
 
 
 class RTLOutputFormat(BaseModel):
@@ -131,6 +181,8 @@ class RTLGenerator:
         self.max_trials = 5
         self.enable_cache = (False,)
         self.rag_chat_engine: Optional[ContextChatEngine] = None
+        self.planner_json_str: Optional[str] = None
+        self.lib_consult_json_str: Optional[str] = None
 
     def reset(self):
         self.history = []
@@ -226,6 +278,18 @@ class RTLGenerator:
                     role=MessageRole.USER,
                 )
             )
+
+        if self.planner_json_str or self.lib_consult_json_str:
+            ret.append(
+                ChatMessage(
+                    content=INTEGRATION_GUIDANCE_PROMPT.format(
+                        planner_json=self.planner_json_str or "{}",
+                        lib_consultant_json=self.lib_consult_json_str or "{}",
+                    ),
+                    role=MessageRole.USER,
+                )
+            )
+
         if (
             isinstance(self.token_counter, TokenCounterCached)
             and self.token_counter.enable_cache
@@ -273,7 +337,7 @@ class RTLGenerator:
         interface: str,
         rtl_path: str,
         enable_cache: bool = False,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, List[str]]:
         if isinstance(self.token_counter, TokenCounterCached):
             self.token_counter.set_enable_cache(enable_cache)
         self.history = []
@@ -281,6 +345,7 @@ class RTLGenerator:
         self.generated_tb = testbench
         self.generated_if = interface
         self.history.extend(self.get_init_prompt_messages(input_spec))
+
         for _ in range(self.max_trials):
             response = self.generate(self.history + self.get_order_prompt_messages())
             resp_obj = self.parse_output(response)
@@ -290,13 +355,18 @@ class RTLGenerator:
                 )
                 continue
             rtl_code = resp_obj.module
+            rtl_lib_obj = _safe_json_loads(self.lib_consult_json_str)
+            rtl_lib = _collect_rtl_libs(_append_rtl_libs(rtl_lib_obj))
+            rtl_path_lib = os.path.join(os.path.dirname(rtl_path), "rtl_lib.sv")
             with open(rtl_path, "w") as f:
                 f.write(rtl_code)
-            slang_ok, slang_out = compile_slang(rtl_path=rtl_path, mode="elab")
-            iver_ok, iver_out = check_syntax_iverilog(rtl_path=rtl_path)
-
-            # Treat as pass only if BOTH tools pass (so we fix anything either tool flags)
-            syntax_correct = slang_ok and iver_ok
+            with open(rtl_path_lib, "w") as f:
+                f.write(rtl_lib)
+            # We want to compile/elaborate the generated RTL and the library modules
+            slang_ok, slang_out = compile_slang(
+                rtl_path=rtl_path, mode="elab", top="TopModule"
+            )
+            iver_ok, iver_out = check_syntax(rtl_path=rtl_path, simulator="questa")
 
             # Concatenate logs so the LLM can address all errors in one go
             syntax_output = (
@@ -306,6 +376,10 @@ class RTLGenerator:
                 f"{iver_out}\n"
             )
 
+            # Treat as pass only if BOTH tools pass (so we fix anything either
+            # tool flags)
+            syntax_correct = slang_ok and iver_ok
+
             if syntax_correct:
                 break
 
@@ -314,7 +388,7 @@ class RTLGenerator:
                 [response.message]
                 + self.get_format_error_prompt_messages(syntax_output, rtl_code)
             )
-        return (syntax_correct, rtl_code)
+        return (syntax_correct, rtl_code, rtl_lib)
 
     def gen_candidates(
         self,
@@ -347,7 +421,7 @@ class RTLGenerator:
                     f.write(rtl_code)
 
                 slang_ok, slang_out = compile_slang(rtl_path=rtl_path, mode="elab")
-                iver_ok, iver_out = check_syntax_iverilog(rtl_path=rtl_path)
+                iver_ok, iver_out = check_syntax(rtl_path=rtl_path, simulator="questa")
 
                 syntax_correct = slang_ok and iver_ok
                 syntax_output = (
@@ -398,9 +472,8 @@ class RTLGenerator:
             with open(rtl_path, "w") as f:
                 f.write(rtl_code)
 
-            # --- Dual syntax checks: slang (parse+elab) then iverilog (parse) ---
             slang_ok, slang_out = compile_slang(rtl_path=rtl_path, mode="elab")
-            iver_ok, iver_out = check_syntax_iverilog(rtl_path=rtl_path)
+            iver_ok, iver_out = check_syntax(rtl_path=rtl_path, simulator="questa")
 
             syntax_correct = slang_ok and iver_ok
             if syntax_correct:

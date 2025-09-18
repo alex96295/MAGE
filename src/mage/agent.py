@@ -8,7 +8,9 @@ from typing import List, Tuple
 from llama_index.core.embeddings import resolve_embed_model
 from llama_index.core.llms import LLM
 
+from .design_planner import DesignPlanner
 from .doc_utils import CorpusPaths, DocumentManager, ParserConfig
+from .lib_consultant import LibConsultant
 from .lint_reviewer import LintReviewer
 from .log_utils import get_logger, set_log_dir, switch_log_to_file, switch_log_to_stdout
 from .rtl_editor import RTLEditor
@@ -39,6 +41,7 @@ class TopAgent:
         self.output_path = "./output"
         self.log_path = "./log"
         self.assets_path = "./assets"
+        self.lib_path = "./pulp-verilog-eval/out/lib"
         self.assets_docs_path = "./.documents"
         self.assets_docs_dict = {}
         self.golden_tb_path: str | None = None
@@ -50,6 +53,12 @@ class TopAgent:
         self.rtl_edit: RTLEditor | None = None
         self.style_reviewer: StyleReviewer | None = None
         self.lint_reviewer: LintReviewer | None = None
+
+        self.design_planner: DesignPlanner | None = None
+        self.lib_consultant: LibConsultant | None = None
+
+        self._design_plan_text: str | None = None
+        self._lib_hints_text: str | None = None
 
     def prepare_documents(self) -> None:
         """Parse or load documents from assets/ subdirectories and store them as JSON."""
@@ -90,6 +99,12 @@ class TopAgent:
                 f"for assets subdirectory '{assets_subdir}'"
             )
 
+    def set_assets_path(self, assets_path: str) -> None:
+        self.assets_path = assets_path
+
+    def set_lib_path(self, lib_path: str) -> None:
+        self.lib_path = lib_path
+
     def set_output_path(self, output_path: str) -> None:
         self.output_path = output_path
 
@@ -111,6 +126,36 @@ class TopAgent:
         with open(f"{self.output_dir_per_run}/{file_name}", "w") as f:
             f.write(content)
 
+    def _run_design_planning_phase(self, spec: str) -> Tuple[str, str]:
+        """
+        Returns (design_plan_text, lib_hints_text).
+        These strings are persisted to disk and cached on the instance for later consumption.
+        """
+        assert self.design_planner is not None
+        assert self.lib_consultant is not None
+
+        # Plan the design
+        logger.info("[DesignPlanner] Starting design planning phase.")
+        design_plan_json = self.design_planner.chat(spec)
+        logger.info("[DesignPlanner] Plan produced and saved.")
+
+        # Library/IP recommendations
+        logger.info("[LibConsultant] Starting library consulting phase.")
+        lib_hints_json = self.lib_consultant.consult(plan=design_plan_json)
+        logger.info("[LibConsultant] Library notes produced.")
+
+        # Cache and persist
+        self._design_plan_json = design_plan_json or ""
+        self._lib_hints_json = lib_hints_json or ""
+
+        try:
+            self.write_output(self._design_plan_json, "design_plan.json")
+            self.write_output(self._lib_hints_json, "lib_hints.json")
+        except Exception:
+            logger.warning("Failed to persist planning artifacts.", exc_info=True)
+
+        return self._design_plan_json, self._lib_hints_json
+
     def run_instance(self, spec: str) -> Tuple[bool, str]:
         """
         Run a single instance of the benchmark
@@ -123,6 +168,10 @@ class TopAgent:
         assert self.sim_reviewer
         assert self.sim_judge
         assert self.rtl_edit
+
+        plan_text, lib_text = self._run_design_planning_phase(spec)
+
+        os._exit(1)
 
         self.tb_gen.reset()
         self.tb_gen.set_golden_tb_path(self.golden_tb_path)
@@ -138,11 +187,14 @@ class TopAgent:
         self.rtl_gen.reset()
         logger.info(spec)
 
-        is_syntax_pass, rtl_code = self.rtl_gen.chat(
+        # Pass plan/lib hints
+        is_syntax_pass, rtl_code, _ = self.rtl_gen.chat(
             input_spec=spec,
             testbench=testbench,
             interface=interface,
             rtl_path=os.path.join(self.output_dir_per_run, "rtl.sv"),
+            design_plan=plan_text,
+            lib_hints=lib_text,
         )
         if not is_syntax_pass:
             return False, rtl_code
@@ -155,7 +207,9 @@ class TopAgent:
         sim_log = ""
         for i in range(self.sim_max_retry):
             # run simulation judge, overwrite is_sim_pass
-            is_sim_pass, sim_mismatch_cnt, sim_log = self.sim_reviewer.review()
+            is_sim_pass, sim_mismatch_cnt, sim_log = self.sim_reviewer.review(
+                simulator="questa"
+            )
             if is_sim_pass:
                 tb_need_fix = False
                 rtl_need_fix = False
@@ -186,6 +240,8 @@ class TopAgent:
                 sim_mismatch_cnt > 0
             ), f"rtl_need_fix should be True only when sim_mismatch_cnt > 0. sim_log: {sim_log}"
             self.rtl_gen.reset()
+
+            # seed with cache-enabled attempt including plan/lib hints
             candidates = [
                 self.rtl_gen.chat(
                     input_spec=spec,
@@ -193,6 +249,8 @@ class TopAgent:
                     interface=interface,
                     rtl_path=os.path.join(self.output_dir_per_run, "rtl.sv"),
                     enable_cache=True,
+                    design_plan=self._design_plan_text,
+                    lib_hints=self._lib_hints_text,
                 )
             ]  # Write Cache
             if self.rtl_max_candidates > 1:
@@ -213,7 +271,7 @@ class TopAgent:
                     continue
                 self.write_output(rtl_code_candidate, "rtl.sv")
                 is_sim_pass_candidate, sim_mismatch_cnt_candidate, sim_log_candidate = (
-                    self.sim_reviewer.review()
+                    self.sim_reviewer.review(simulator="questa")
                 )
                 if is_sim_pass_candidate:
                     rtl_code = rtl_code_candidate
@@ -255,7 +313,9 @@ class TopAgent:
                     break
 
         if not is_sim_pass:  # Run if keep failing before last try
-            is_sim_pass, _, _ = self.sim_reviewer.review()
+            is_sim_pass, _, _ = self.sim_reviewer.review(simulator="questa")
+
+        os._exit(1)
 
         # policy/consistency check vs style guide (based on descriptive rules)
         if is_sim_pass and self.style_reviewer is not None:
@@ -278,7 +338,9 @@ class TopAgent:
             self.write_output(styled_tb, "tb.sv")
 
             # Re-run sim to ensure no behavior change
-            style_sim_pass, _, style_sim_log = self.sim_reviewer.review()
+            style_sim_pass, _, style_sim_log = self.sim_reviewer.review(
+                simulator="questa"
+            )
             if style_sim_pass:
                 logger.info("[StyleReviewer] Simulation PASSED after styling.")
                 rtl_code = styled_rtl
@@ -306,7 +368,7 @@ class TopAgent:
                 self.write_output(original_rtl, "rtl.sv")
                 self.write_output(original_tb, "tb.sv")
                 # Ensure sim still passes with originals (it should)
-                _ = self.sim_reviewer.review()
+                _ = self.sim_reviewer.review(simulator="questa")
 
         # rule-driven lint/formatting
         if is_sim_pass and self.lint_reviewer is not None:
@@ -337,7 +399,9 @@ class TopAgent:
             )
 
             # Re-run sim to ensure no behavior change post-lint/format
-            lint_sim_pass, _, lint_sim_log = self.sim_reviewer.review()
+            lint_sim_pass, _, lint_sim_log = self.sim_reviewer.review(
+                simulator="questa"
+            )
             if lint_sim_pass:
                 logger.info("[LintReviewer] Simulation PASSED after format+lint.")
                 rtl_code = final_rtl
@@ -374,7 +438,7 @@ class TopAgent:
                 self.write_output(lr_in_rtl, "rtl.sv")
                 self.write_output(lr_in_tb, "tb.sv")
                 # Sanity: re-run sim to confirm ok
-                _ = self.sim_reviewer.review()
+                _ = self.sim_reviewer.review(simulator="questa")
 
         return is_sim_pass, rtl_code
 
@@ -386,6 +450,9 @@ class TopAgent:
         - rtl_code: str, the generated RTL code
         """
         assert self.rtl_gen
+
+        if self.design_planner and self.lib_consultant:
+            self._run_design_planning_phase(spec)
 
         self.rtl_gen.reset()
         logger.info(spec)
@@ -422,10 +489,14 @@ class TopAgent:
             self.style_reviewer = StyleReviewer(self.token_counter)
             self.lint_reviewer = LintReviewer(self.token_counter)
 
+            self.design_planner = DesignPlanner(self.token_counter)
+            self.lib_consultant = LibConsultant(self.embed_model)
+
             # tune docs for rag based on the agent. Key idea is that not all
             # the agents need the same knowledge (divide et impera)
             language_docs = self.assets_docs_dict.get("language", [])
             style_docs = self.assets_docs_dict.get("style_guide", [])
+
             tb_gen_docs = list(language_docs)
             rtl_gen_docs = list(language_docs)
             style_reviewer_docs = list(style_docs)
@@ -452,8 +523,22 @@ class TopAgent:
                 embed_model=self.embed_model,
             )
 
-            # configure lint reviewer (rules/waivers/format width)
+            self.design_planner.init_rag(
+                persist_dir="./.vector_storage/rtl_gen",
+                faiss_path="./.faiss_storage/rtl_gen_faiss.bin",
+                docs=rtl_gen_docs,
+                embed_model=self.embed_model,
+            )
+
+            self.lib_consultant.ingest_from_dir(self.lib_path)
+            self.lib_consultant.build_index()
+
+            os._exit(1)
+
+            # configure lint reviewer
             self.lint_reviewer.set_lint_autofix(mode="inplace")
+
+            os._exit(1)
 
             ret = (
                 self.run_instance(spec)
@@ -464,6 +549,7 @@ class TopAgent:
             with open(f"{self.output_dir_per_run}/properly_finished.tag", "w") as f:
                 f.write("1")
         except Exception:
+            os._exit(1)
             exc_info = sys.exc_info()
             traceback.print_exception(*exc_info)
             ret = False, f"Exception: {exc_info[1]}"

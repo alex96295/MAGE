@@ -1,4 +1,4 @@
-# compile_reviewer.py
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -43,9 +43,9 @@ def _has_error_token(stdout: str, stderr: str) -> bool:
 def compile_slang(
     *,
     rtl_path: Optional[str] = None,
-    filelist: Optional[str] = None,
     mode: str = "elab",  # "parse" | "lint" | "elab"
     top: Optional[str] = None,
+    std: Optional[str] = None,  # e.g. "1800-2017"
     timescale: Optional[str] = None,  # e.g. "1ns/1ns"
     extra_flags: Optional[List[str]] = None,  # e.g. ["--relax-enum-conversions", ...]
     compile_bin: str = "oseda -2025.03 slang",
@@ -60,22 +60,14 @@ def compile_slang(
       mode="elab":        (no extra flag; performs parse+checks+elaboration)
     - Pass criteria: successful exit, no 'error' diagnostics, and benign/empty stderr.
     """
-    assert (rtl_path is None) ^ (
-        filelist is None
-    ), "Provide exactly one of rtl_path OR filelist."
+
+    rtl_path_lib = os.path.join(os.path.dirname(rtl_path), "rtl_lib.sv")
 
     args: List[str] = [compile_bin]
-    if filelist is not None:
-        args += ["-f", filelist]
-    elif rtl_path is not None:
-        args += [rtl_path]
-    elif rtl_path and filelist:
-        logger.warning(
-            "CompileReviewer Both rtl_path and filelist provided. Using rtl_path as default."
-        )
-    else:
-        logger.error("CompileReviewer Slang requires a single RTL file or file list")
+    args += [rtl_path_lib]
+    args += [rtl_path]
 
+    args += [f"--std={std}"] if std else [f"--std=1800-2017"]
     args += [f"--timescale={timescale}"] if timescale else [f"--timescale=1ns/1ns"]
 
     args += (

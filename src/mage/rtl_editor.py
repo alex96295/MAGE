@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from .compile_reviewer import compile_slang
 from .log_utils import get_logger
 from .prompts import ORDER_PROMPT, SV_LANGUAGE_DIRECTIVES_PROMPT
-from .sim_reviewer import SimReviewer, check_syntax_iverilog
+from .sim_reviewer import SimReviewer, check_syntax
 from .token_counter import TokenCounter, TokenCounterCached
 
 logger = get_logger(__name__)
@@ -154,7 +154,7 @@ class RTLEditor:
     def replace_sanity_check(self) -> Dict[str, Any]:
         # Run dual syntax checks: slang (parse+elab) AND iverilog (parse)
         slang_ok, slang_out = compile_slang(self.rtl_path, mode="elab")
-        iver_ok, iver_out = check_syntax_iverilog(self.rtl_path)
+        iver_ok, iver_out = check_syntax(self.rtl_path, simulator="questa")
 
         if slang_ok and iver_ok:
             syntax_output = "Syntax checks passed (slang + iverilog)."
@@ -173,7 +173,9 @@ class RTLEditor:
                 "sim_mismatch_cnt": 0,
             }
 
-        is_sim_pass, sim_mismatch_cnt, sim_output = self.sim_reviewer.review()
+        is_sim_pass, sim_mismatch_cnt, sim_output = self.sim_reviewer.review(
+            simulator="questa"
+        )
         assert isinstance(sim_mismatch_cnt, int)
 
         return {
