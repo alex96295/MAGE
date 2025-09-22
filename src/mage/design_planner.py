@@ -1,10 +1,12 @@
 import json
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 from llama_index.core import Document
 from llama_index.core.base.embeddings.base import BaseEmbedding
+from llama_index.core.base.llms.generic_utils import prompt_to_messages
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
 from llama_index.core.chat_engine import ContextChatEngine
+from llama_index.core.chat_engine.types import AgentChatResponse
 from pydantic import BaseModel, Field
 
 from .log_utils import get_logger
@@ -22,9 +24,8 @@ Planning goals:
 1) REUSE: identify concrete, primitive submodules likely to be instantiated in
 the final design. This are submodules that you wish, as a design planner, to
 have in the design and that another independent agent will try to fetch from a
-design library. This phase f the design planning is the high-level equivalent
-of reasoning on the BLOCK DIAGRAM of the module to be designed based on the
-spec.
+design library. This phase of design planning is the high-level equivalent of
+reasoning with the block diagram of the module, based on the specification.
 2) CONSULT: identify similar designs (even with different protocols) to guide
 naming, parameters, and structure. These submodules are not for reuse
 (instantiation) in the design to be generated, but merely for consultancy
@@ -110,6 +111,7 @@ class DesignPlanner:
         faiss_path: str = "./.faiss_storage/design_planner_faiss.bin",
         docs: Sequence[Document] = None,
         embed_model: BaseEmbedding = None,
+        memory_token_limit: int = 1500,
     ) -> None:
         """
         Optional: allow lightweight RAG (e.g., style guides or methodology notes).
@@ -122,17 +124,19 @@ class DesignPlanner:
             persist_dir=persist_dir,
             faiss_path=faiss_path,
             top_k=2,
-            memory_token_limit=1500,
+            memory_token_limit=memory_token_limit,
             docs=docs,
             embed_model=embed_model,
         )
         logger.info("DesignPlanner RAG initialized.")
 
-    def generate(self, messages: List[ChatMessage]) -> ChatResponse:
-        logger.info(f"[DesignPlanner] messages -> LLM: {messages}")
-        resp, token_cnt = self.token_counter.count_chat(messages, self.rag_chat_engine)
-        logger.info(f"[DesignPlanner] token count: {token_cnt}")
-        logger.info(f"[DesignPlanner] raw response: {resp.message.content}")
+    def generate(
+        self, messages: List[ChatMessage]
+    ) -> Union[ChatResponse, AgentChatResponse]:
+        resp, token_cnt = self.token_counter.count_chat(
+            messages, rag_chat_engine=self.rag_chat_engine
+        )
+        logger.info(f"DesignPlanner token count: {token_cnt}")
         return resp
 
     def parse_output(self, response: ChatResponse) -> PlannerOutput:
@@ -182,10 +186,18 @@ class DesignPlanner:
                 self.history
                 + [ChatMessage(content=ORDER_PROMPT, role=MessageRole.USER)]
             )
+            if isinstance(response, ChatResponse):
+                raw_text = response.message.content
+                message = response.message
+            elif isinstance(response, AgentChatResponse):
+                raw_text = response.response
+                message = prompt_to_messages(raw_text)
+            else:
+                raise TypeError(f"Unexpected response type: {type(response)}")
 
             # Try to parse
             try:
-                obj = json.loads(response.message.content, strict=False)
+                obj = json.loads(raw_text, strict=False)
                 parsed_candidate = PlannerOutput(**obj)
                 # success
                 parsed = parsed_candidate
@@ -196,10 +208,10 @@ class DesignPlanner:
                 )
                 plan_json_str = json.dumps(payload, indent=2, ensure_ascii=False)
                 # keep last successful assistant message in history (debug parity with RTL)
-                self.history.append(response.message)
+                self.history.append(message)
                 break
             except Exception:
-                self.history.append(response.message)
+                self.history.append(message)
                 continue
 
         # If all attempts failed, return an empty but valid object

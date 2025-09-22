@@ -131,8 +131,9 @@ def get_llm(**kwargs) -> LLM:
         raise ValueError(f"gen_config: Invalid provider: {provider}")
 
     try:
-        resp = llm.complete("Say 'Hi Ale'")
-        print(resp.text)
+        print("TODO bring back LLM smoke test")
+        # resp = llm.complete("Say 'Hi Ale'")
+        # print(resp.text)
     except Exception as e:
         raise Exception(
             f"gen_config: Failed to complete LLM chat for {provider}"

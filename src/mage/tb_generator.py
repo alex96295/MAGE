@@ -1,10 +1,12 @@
 import json
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from llama_index.core import Document
 from llama_index.core.base.embeddings.base import BaseEmbedding
+from llama_index.core.base.llms.generic_utils import prompt_to_messages
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
 from llama_index.core.chat_engine import ContextChatEngine
+from llama_index.core.chat_engine.types import AgentChatResponse
 from pydantic import BaseModel
 
 from .log_utils import get_logger
@@ -232,6 +234,7 @@ class TBGenerator:
         faiss_path: str = "./.faiss_storage/tb_gen_faiss.bin",
         docs: Sequence[Document] = None,
         embed_model: BaseEmbedding = None,
+        memory_token_limit: int = 1500,
     ) -> None:
         """
         Build/load a vector index from docs, create a retriever and a chat engine.
@@ -249,7 +252,7 @@ class TBGenerator:
             persist_dir=persist_dir,
             faiss_path=faiss_path,
             top_k=2,
-            memory_token_limit=1500,
+            memory_token_limit=memory_token_limit,
             docs=docs,
             embed_model=embed_model,
         )
@@ -271,11 +274,21 @@ class TBGenerator:
             ChatMessage(content=cur_failed_trial, role=MessageRole.USER)
         )
 
-    def generate(self, messages: List[ChatMessage]) -> ChatResponse:
+    def generate(
+        self, messages: List[ChatMessage]
+    ) -> Union[ChatResponse, AgentChatResponse]:
         logger.info(f"TB generator input message: {messages}")
-        resp, token_cnt = self.token_counter.count_chat(messages, self.rag_chat_engine)
+        resp, token_cnt = self.token_counter.count_chat(
+            messages, rag_chat_engine=self.rag_chat_engine
+        )
         logger.info(f"Token count: {token_cnt}")
-        logger.info(f"{resp.message.content}")
+        if isinstance(resp, ChatResponse):
+            raw_text = resp.message.content
+        elif isinstance(resp, AgentChatResponse):
+            raw_text = resp.response
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+        logger.info(f"{raw_text}")
         return resp
 
     def get_init_prompt_messages(self, input_spec: str) -> List[ChatMessage]:
@@ -329,9 +342,17 @@ class TBGenerator:
 
         return [order_prompt_message]
 
-    def parse_output(self, response: ChatResponse) -> TBOutputFormat:
+    def parse_output(
+        self, response: Union[ChatResponse, AgentChatResponse]
+    ) -> TBOutputFormat:
         try:
-            output_json_obj: Dict = json.loads(response.message.content, strict=False)
+            if isinstance(response, ChatResponse):
+                raw_text = response.message.content
+            elif isinstance(response, AgentChatResponse):
+                raw_text = response.response
+            else:
+                raise TypeError(f"Unexpected response type: {type(response)}")
+            output_json_obj: Dict = json.loads(raw_text, strict=False)
             ret = TBOutputFormat(
                 reasoning=output_json_obj["reasoning"],
                 interface=output_json_obj["interface"],
@@ -357,9 +378,15 @@ class TBGenerator:
             if not resp_obj.reasoning.startswith("Json Decode Error"):
                 break
             error_msg = ChatMessage(role=MessageRole.USER, content=resp_obj.reasoning)
-            self.history.extend([response.message, error_msg])
+            if isinstance(response, ChatResponse):
+                raw_text = response.message.content
+                message = response.message
+            elif isinstance(response, AgentChatResponse):
+                raw_text = response.response
+                message = prompt_to_messages(response.response)
+            else:
+                raise TypeError(f"Unexpected response type: {type(response)}")
+            self.history.extend([message, error_msg])
         if resp_obj.reasoning.startswith("Json Decode Error"):
-            raise ValueError(
-                f"Json Decode Error when decoding: {response.message.content}"
-            )
+            raise ValueError(f"Json Decode Error when decoding: {raw_text}")
         return (resp_obj.testbench, resp_obj.interface)

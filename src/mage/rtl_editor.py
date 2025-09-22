@@ -1,8 +1,12 @@
 import json
 from inspect import signature
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from llama_index.core import Document
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
+from llama_index.core.chat_engine import ContextChatEngine
+from llama_index.core.chat_engine.types import AgentChatResponse
 from pydantic import BaseModel
 
 from .compile_reviewer import compile_slang
@@ -137,6 +141,37 @@ class RTLEditor:
         self.is_done = False
         self.last_mismatch_cnt: int | None = None
         self.sim_reviewer = sim_reviewer
+        self.rag_chat_engine: Optional[ContextChatEngine] = None
+
+    def init_rag(
+        self,
+        persist_dir: str = "./.vector_storage/tb_gen",
+        faiss_path: str = "./.faiss_storage/tb_gen_faiss.bin",
+        docs: Sequence[Document] = None,
+        embed_model: BaseEmbedding = None,
+        memory_token_limit: int = 1500,
+    ) -> None:
+        """
+        Build/load a vector index from docs, create a retriever and a chat engine.
+        """
+
+        if not docs:
+            logger.error(
+                "RTLGenerator No documents found to init RAG. "
+                "Vector index will not be created."
+            )
+            return
+
+        self.rag_chat_engine = self.token_counter.init_rag(
+            persist_dir=persist_dir,
+            faiss_path=faiss_path,
+            top_k=2,
+            memory_token_limit=memory_token_limit,
+            docs=docs,
+            embed_model=embed_model,
+        )
+
+        logger.info("RTLGenerator RAG initialized.")
 
     def reset(self):
         self.is_done = False
@@ -314,11 +349,21 @@ class RTLEditor:
         # ret["new_file_content"] = new_file_content
         return ret
 
-    def generate(self, messages: List[ChatMessage]) -> ChatResponse:
+    def generate(
+        self, messages: List[ChatMessage]
+    ) -> Union[ChatResponse, AgentChatResponse]:
         logger.info(f"RTL editor input message: {messages}")
-        resp, token_cnt = self.token_counter.count_chat(messages)
+        resp, token_cnt = self.token_counter.count_chat(
+            messages, rag_chat_engine=self.rag_chat_engine
+        )
         logger.info(f"Token count: {token_cnt}")
-        logger.info(f"{resp.message.content}")
+        if isinstance(resp, ChatResponse):
+            raw_text = resp.message.content
+        elif isinstance(resp, AgentChatResponse):
+            raw_text = resp.response
+        else:
+            raise TypeError(f"Unexpected response type: {type(resp)}")
+        logger.info(f"{raw_text}")
         return resp
 
     def gen_action_prompt(self, function) -> str:
@@ -366,8 +411,17 @@ class RTLEditor:
             ),
         ]
 
-    def parse_output(self, response: ChatResponse) -> RTLEditorStepOutput:
-        output_json_obj: Dict = json.loads(response.message.content, strict=False)
+    def parse_output(
+        self, response: Union[ChatResponse, AgentChatResponse]
+    ) -> RTLEditorStepOutput:
+        if isinstance(response, ChatResponse):
+            raw_text = response.message.content
+        elif isinstance(response, AgentChatResponse):
+            raw_text = response.response
+        else:
+            raise TypeError(f"Unexpected response type: {type(response)}")
+
+        output_json_obj: Dict = json.loads(raw_text, strict=False)
         action_input = output_json_obj["action_input"]
         command = action_input["command"]
 

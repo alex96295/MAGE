@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import tiktoken
 from anthropic.types import Usage
@@ -8,6 +8,7 @@ from llama_index.core import Document
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse
 from llama_index.core.chat_engine import ContextChatEngine
+from llama_index.core.chat_engine.types import AgentChatResponse
 from llama_index.core.llms.llm import LLM
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.llms.anthropic import Anthropic
@@ -136,6 +137,12 @@ class TokenCounter:
         self.max_parallel_requests: int = 10
         self.enable_reformat_json = isinstance(llm, Vertex)
         self.rag_chat_engine: Optional[ContextChatEngine] = None
+
+        self.tpm_limit: Optional[int] = None  # tokens per minute; None disables guard
+        self._tpm_bucket: float = 0.0
+        self._tpm_last_ts: float = time.time()
+        self._tpm_lock = asyncio.Lock()
+
         model = llm.metadata.model_name
         if isinstance(llm, OpenAI):
             self.encoding = tiktoken.encoding_for_model(model)
@@ -158,11 +165,7 @@ class TokenCounter:
             self.encoding = VertexEncoding(llm._client)
             self.activate_structure_output = True
         elif isinstance(llm, Fireworks):
-            # Fireworks exposes an OpenAI-compatible API. For counting inside LlamaIndex,
-            # use cl100k_base (LlamaIndex's default global tokenizer) as a reasonable default.
             try:
-                # If someone passes a Fireworks model whose name is recognized by tiktoken
-                # (rare), this will pick the closest mapping; otherwise fall back.
                 self.encoding = tiktoken.encoding_for_model(model)
             except Exception:
                 self.encoding = tiktoken.get_encoding("cl100k_base")
@@ -184,6 +187,84 @@ class TokenCounter:
             )
             return
         self.token_cost = TOKEN_COSTS[model]
+
+    def set_tpm_limit(self, tpm_limit: Optional[int]) -> None:
+        """Enable/disable TPM guard. Pass None or <=0 to disable."""
+        if tpm_limit is None or tpm_limit <= 0:
+            self.tpm_limit = None
+            self._tpm_bucket = 0.0
+            self._tpm_last_ts = time.time()
+            logger.info("TPM guard disabled")
+            return
+        self.tpm_limit = int(tpm_limit)
+        # Fill the bucket initially to the full minute's allowance.
+        self._tpm_bucket = float(self.tpm_limit)
+        self._tpm_last_ts = time.time()
+        logger.info(f"TPM guard enabled: limit={self.tpm_limit} tokens/min")
+
+    def _tpm_refill(self) -> None:
+        if not self.tpm_limit:
+            return
+        now = time.time()
+        elapsed = now - self._tpm_last_ts
+        self._tpm_last_ts = now
+        # Refill at rate tpm_limit per 60s
+        refill = (self.tpm_limit / 60.0) * elapsed
+        self._tpm_bucket = min(self.tpm_limit, self._tpm_bucket + refill)
+
+    def _tpm_throttle_sync(self, tokens_needed: int) -> None:
+        """Blocking throttle for sync paths."""
+        if not self.tpm_limit or tokens_needed <= 0:
+            return
+        # Use an event loop with agnostic lock via asyncio's lock + loop run
+        # (fine for minimal integration in sync code).
+        loop = None
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            pass
+        if loop and loop.is_running():
+            # Fallback: best-effort without lock if already in an event loop (rare in sync paths)
+            pass
+        else:
+            # Acquire the asyncio lock in a temporary loop to serialize bucket ops
+            loop = loop or asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._tpm_lock.acquire())
+        try:
+            while True:
+                self._tpm_refill()
+                if self._tpm_bucket >= tokens_needed:
+                    self._tpm_bucket -= tokens_needed
+                    break
+                # compute sleep needed
+                deficit = tokens_needed - self._tpm_bucket
+                rate = self.tpm_limit / 60.0
+                sleep_s = max(0.0, deficit / rate)
+                time.sleep(sleep_s)
+                # after sleeping, loop and refill again
+        finally:
+            if self._tpm_lock.locked():
+                try:
+                    self._tpm_lock.release()
+                except RuntimeError:
+                    pass
+
+    async def _tpm_throttle_async(self, tokens_needed: int) -> None:
+        """Async throttle for async paths."""
+        if not self.tpm_limit or tokens_needed <= 0:
+            return
+        async with self._tpm_lock:
+            while True:
+                self._tpm_refill()
+                if self._tpm_bucket >= tokens_needed:
+                    self._tpm_bucket -= tokens_needed
+                    break
+                deficit = tokens_needed - self._tpm_bucket
+                rate = self.tpm_limit / 60.0
+                sleep_s = max(0.0, deficit / rate)
+                await asyncio.sleep(sleep_s)
+                # loop to refill and check again
 
     def set_cur_tag(self, tag: str) -> None:
         self.cur_tag = tag
@@ -221,7 +302,7 @@ class TokenCounter:
             )
             return
 
-        logger.info("TokenCounter Setting up vector index settings")
+        logger.info("TokenCounter Initializing vector index settings")
         settings = VectorIndexSettings(
             persist_dir=persist_dir,
             faiss_path=faiss_path,
@@ -229,7 +310,7 @@ class TokenCounter:
             embed_model=embed_model,
         )
 
-        logger.info("TokenCounter Building or loading vector store and index")
+        logger.info("TokenCounter Creating vector index and retriever")
         _, retriever = create_vector_retriever_from_docs(
             documents=docs,
             v_settings=settings,
@@ -253,64 +334,106 @@ class TokenCounter:
         messages: List[ChatMessage],
         llm: LLM | None = None,
         rag_chat_engine: Optional[ContextChatEngine] = None,
-    ) -> Tuple[ChatResponse, TokenCount]:
+    ) -> Tuple[Union[ChatResponse, AgentChatResponse], TokenCount]:
+        logger.info("Entered TokenCounter.count_chat")
         llm = llm or self.llm
         rag_chat_engine = rag_chat_engine or self.rag_chat_engine
         in_token_cnt = self.count(llm.messages_to_prompt(messages))
+
+        self._tpm_throttle_sync(in_token_cnt)
+
         logger.info(
             "TokenCounter count_chat Triggered at temp: %s, top_p: %s"
             % (settings.temperature, settings.top_p)
         )
         if rag_chat_engine is not None:
-            response = rag_chat_engine.chat(messages)
+            response = rag_chat_engine.chat(llm.messages_to_prompt(messages))
+            out_token_cnt = self.count(response.response)
         else:
             response = llm.chat(
                 messages, top_p=settings.top_p, temperature=settings.temperature
             )
-        out_token_cnt = self.count(response.message.content)
+            out_token_cnt = self.count(response.message.content)
+
+        self._tpm_throttle_sync(out_token_cnt)
+
         token_cnt = TokenCount(in_token_cnt=in_token_cnt, out_token_cnt=out_token_cnt)
         self.token_cnts[self.cur_tag].append(token_cnt)
         if self.enable_reformat_json:
-            response.message.content = reformat_json_string(response.message.content)
+            if rag_chat_engine is not None:
+                response.response = reformat_json_string(response.response)
+            else:
+                response.message.content = reformat_json_string(
+                    response.message.content
+                )
         return (response, token_cnt)
 
     async def count_achat(
-        self, messages: List[ChatMessage], llm: LLM | None = None
-    ) -> Tuple[ChatResponse, TokenCount]:
+        self,
+        messages: List[ChatMessage],
+        llm: LLM | None = None,
+        rag_chat_engine: Optional[ContextChatEngine] = None,
+    ) -> Tuple[Union[ChatResponse, AgentChatResponse], TokenCount]:
         llm = llm or self.llm
+        rag_chat_engine = rag_chat_engine or self.rag_chat_engine
         in_token_cnt = self.count(llm.messages_to_prompt(messages))
+
+        await self._tpm_throttle_async(in_token_cnt)
+
         logger.info(
             "TokenCounter count_achat Triggered at temp: %s, top_p: %s"
             % (settings.temperature, settings.top_p)
         )
-        response = await llm.achat(
-            messages, top_p=settings.top_p, temperature=settings.temperature
-        )
-        out_token_cnt = self.count(response.message.content)
+        if rag_chat_engine is not None:
+            response = rag_chat_engine.achat(llm.messages_to_prompt(messages))
+            out_token_cnt = self.count(response.response)
+        else:
+            response = await llm.achat(
+                messages, top_p=settings.top_p, temperature=settings.temperature
+            )
+            out_token_cnt = self.count(response.message.content)
+
+        await self._tpm_throttle_async(out_token_cnt)
+
         token_cnt = TokenCount(in_token_cnt=in_token_cnt, out_token_cnt=out_token_cnt)
         async with self.token_cnts_lock:
             self.token_cnts[self.cur_tag].append(token_cnt)
         if self.enable_reformat_json:
-            response.message.content = reformat_json_string(response.message.content)
+            if rag_chat_engine is not None:
+                response.response = reformat_json_string(response.response)
+            else:
+                response.message.content = reformat_json_string(
+                    response.message.content
+                )
         return (response, token_cnt)
 
     async def count_achat_batch(
-        self, chat_inputs: List[List[ChatMessage]], llm: LLM | None = None
-    ) -> List[Tuple[ChatResponse, TokenCount]]:
+        self,
+        chat_inputs: List[List[ChatMessage]],
+        llm: LLM | None = None,
+        rag_chat_engine: Optional[ContextChatEngine] = None,
+    ) -> List[Tuple[Union[ChatResponse, AgentChatResponse], TokenCount]]:
         llm = llm or self.llm
+        rag_chat_engine = rag_chat_engine or self.rag_chat_engine
         results = []
         for i in range(0, len(chat_inputs), self.max_parallel_requests):
             batch = chat_inputs[i : i + self.max_parallel_requests]
             tasks = [
-                self.count_achat(llm=llm, messages=chat_input) for chat_input in batch
+                self.count_achat(
+                    llm=llm, rag_chat_engine=rag_chat_engine, messages=chat_input
+                )
+                for chat_input in batch
             ]
             batch_results = await asyncio.gather(*tasks)
             results.extend(batch_results)
         return results
 
     def count_chat_batch(
-        self, chat_inputs: List[List[ChatMessage]], llm: LLM | None = None
-    ) -> List[Tuple[ChatResponse, TokenCount]]:
+        self,
+        chat_inputs: List[List[ChatMessage]],
+        llm: LLM | None = None,
+        rag_chat_engine: Optional[ContextChatEngine] = None,
+    ) -> List[Tuple[Union[ChatResponse, AgentChatResponse], TokenCount]]:
         llm = llm or self.llm
         try:
             # Get the current event loop
@@ -321,7 +444,9 @@ class TokenCounter:
             asyncio.set_event_loop(loop)
         start_time = time.time()
         results = loop.run_until_complete(
-            self.count_achat_batch(llm=llm, chat_inputs=chat_inputs)
+            self.count_achat_batch(
+                llm=llm, rag_chat_engine=rag_chat_engine, chat_inputs=chat_inputs
+            )
         )
         logger.info(f"Total batch chat time: {time.time() - start_time:.2f}s")
         return results
@@ -409,6 +534,12 @@ class TokenCounterCached(TokenCounter):
             "TokenCounterCached count_chat Triggered at temp: %s, top_p: %s"
             % (settings.temperature, settings.top_p)
         )
+
+        # Pre-calculate input tokens for TPM throttle
+        # For Anthropic we could also wait on usage, but we want pre-call throttle for inputs.
+        in_token_est = self.count(llm.messages_to_prompt(messages))
+        self._tpm_throttle_sync(in_token_est)
+
         response = llm.chat(
             messages,
             top_p=settings.top_p,
@@ -430,6 +561,10 @@ class TokenCounterCached(TokenCounter):
                 else 0
             ),
         )
+
+        # Post-call throttle with *actual* output tokens (and ensure we also account for any diff on input)
+        self._tpm_throttle_sync(token_cnt.out_token_cnt)
+
         self.token_cnts[self.cur_tag].append(token_cnt)
         if self.enable_reformat_json:
             response.message.content = reformat_json_string(response.message.content)
@@ -443,6 +578,10 @@ class TokenCounterCached(TokenCounter):
             "TokenCounterCached count_achat Triggered at temp: %s, top_p: %s"
             % (settings.temperature, settings.top_p)
         )
+
+        in_token_est = self.count(llm.messages_to_prompt(messages))
+        await self._tpm_throttle_async(in_token_est)
+
         response = await llm.achat(
             messages,
             top_p=settings.top_p,
@@ -464,6 +603,9 @@ class TokenCounterCached(TokenCounter):
                 else 0
             ),
         )
+
+        await self._tpm_throttle_async(token_cnt.out_token_cnt)
+
         async with self.token_cnts_lock:
             self.token_cnts[self.cur_tag].append(token_cnt)
         if self.enable_reformat_json:

@@ -1,10 +1,11 @@
 # style_reviewer.py
 import json
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
 from llama_index.core.chat_engine import ContextChatEngine
+from llama_index.core.chat_engine.types import AgentChatResponse
 from pydantic import BaseModel
 
 from .log_utils import get_logger
@@ -148,6 +149,7 @@ class StyleReviewer:
         faiss_path: str = "./.faiss_storage/style_reviewer_faiss.bin",
         docs: Optional[Sequence] = None,
         embed_model: BaseEmbedding = None,
+        memory_token_limit: int = 1500,
     ) -> None:
         """
         Build/load a vector index from docs and create a retriever/chat engine.
@@ -165,7 +167,7 @@ class StyleReviewer:
             persist_dir=persist_dir,
             faiss_path=faiss_path,
             top_k=2,
-            memory_token_limit=1500,
+            memory_token_limit=memory_token_limit,
             docs=docs,
             embed_model=embed_model,
         )
@@ -195,16 +197,28 @@ class StyleReviewer:
             self.token_counter.add_cache_tag(msgs[-1])
         return msgs
 
-    def _chat(self, messages: List[ChatMessage]) -> ChatResponse:
+    def _chat(
+        self, messages: List[ChatMessage]
+    ) -> Union[ChatResponse, AgentChatResponse]:
         logger.info(f"Style reviewer input message count: {len(messages)}")
-        resp, token_cnt = self.token_counter.count_chat(messages, self.rag_chat_engine)
+        resp, token_cnt = self.token_counter.count_chat(
+            messages, rag_chat_engine=self.rag_chat_engine
+        )
         logger.info(f"Style reviewer token count: {token_cnt}")
         logger.info(f"Style reviewer raw response: {resp.message.content[:500]}...")
         return resp
 
-    def _parse_output(self, response: ChatResponse) -> Optional[StyleReviewOutput]:
+    def _parse_output(
+        self, response: Union[ChatResponse, AgentChatResponse]
+    ) -> Optional[StyleReviewOutput]:
         try:
-            payload = json.loads(response.message.content, strict=False)
+            if isinstance(response, ChatResponse):
+                raw_text = response.message.content
+            elif isinstance(response, AgentChatResponse):
+                raw_text = response.response
+            else:
+                raise TypeError(f"Unexpected response type: {type(response)}")
+            payload = json.loads(raw_text, strict=False)
             return StyleReviewOutput(
                 reasoning=payload["reasoning"],
                 is_uvm_tb=payload["is_uvm_tb"],

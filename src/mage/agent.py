@@ -141,7 +141,9 @@ class TopAgent:
 
         # Library/IP recommendations
         logger.info("[LibConsultant] Starting library consulting phase.")
-        lib_hints_json = self.lib_consultant.consult(plan=design_plan_json)
+        lib_hints_json = self.lib_consultant.consult(
+            design_plan=json.loads(design_plan_json)
+        )
         logger.info("[LibConsultant] Library notes produced.")
 
         # Cache and persist
@@ -170,8 +172,6 @@ class TopAgent:
         assert self.rtl_edit
 
         plan_text, lib_text = self._run_design_planning_phase(spec)
-
-        os._exit(1)
 
         self.tb_gen.reset()
         self.tb_gen.set_golden_tb_path(self.golden_tb_path)
@@ -314,8 +314,6 @@ class TopAgent:
 
         if not is_sim_pass:  # Run if keep failing before last try
             is_sim_pass, _, _ = self.sim_reviewer.review(simulator="questa")
-
-        os._exit(1)
 
         # policy/consistency check vs style guide (based on descriptive rules)
         if is_sim_pass and self.style_reviewer is not None:
@@ -487,7 +485,7 @@ class TopAgent:
                 self.token_counter, sim_reviewer=self.sim_reviewer
             )
             self.style_reviewer = StyleReviewer(self.token_counter)
-            self.lint_reviewer = LintReviewer(self.token_counter)
+            self.lint_reviewer = LintReviewer()
 
             self.design_planner = DesignPlanner(self.token_counter)
             self.lib_consultant = LibConsultant(self.embed_model)
@@ -502,14 +500,25 @@ class TopAgent:
             style_reviewer_docs = list(style_docs)
 
             # init rag for agents
+            memory_padding = 256
+
+            logger.info("Initialize RAG for agents")
             self.tb_gen.init_rag(
                 persist_dir="./.vector_storage/tb_gen",
                 faiss_path="./.faiss_storage/tb_gen_faiss.bin",
                 docs=tb_gen_docs,
                 embed_model=self.embed_model,
+                memory_token_limit=self.llm.metadata.context_window - memory_padding,
             )
 
             self.rtl_gen.init_rag(
+                persist_dir="./.vector_storage/rtl_gen",
+                faiss_path="./.faiss_storage/rtl_gen_faiss.bin",
+                docs=rtl_gen_docs,
+                embed_model=self.embed_model,
+            )
+
+            self.rtl_edit.init_rag(
                 persist_dir="./.vector_storage/rtl_gen",
                 faiss_path="./.faiss_storage/rtl_gen_faiss.bin",
                 docs=rtl_gen_docs,
@@ -521,6 +530,7 @@ class TopAgent:
                 faiss_path="./.faiss_storage/style_reviewer_faiss.bin",
                 docs=style_reviewer_docs,
                 embed_model=self.embed_model,
+                memory_token_limit=self.llm.metadata.context_window - memory_padding,
             )
 
             self.design_planner.init_rag(
@@ -528,17 +538,14 @@ class TopAgent:
                 faiss_path="./.faiss_storage/rtl_gen_faiss.bin",
                 docs=rtl_gen_docs,
                 embed_model=self.embed_model,
+                memory_token_limit=self.llm.metadata.context_window - memory_padding,
             )
 
             self.lib_consultant.ingest_from_dir(self.lib_path)
             self.lib_consultant.build_index()
 
-            os._exit(1)
-
             # configure lint reviewer
             self.lint_reviewer.set_lint_autofix(mode="inplace")
-
-            os._exit(1)
 
             ret = (
                 self.run_instance(spec)
@@ -549,7 +556,6 @@ class TopAgent:
             with open(f"{self.output_dir_per_run}/properly_finished.tag", "w") as f:
                 f.write("1")
         except Exception:
-            os._exit(1)
             exc_info = sys.exc_info()
             traceback.print_exception(*exc_info)
             ret = False, f"Exception: {exc_info[1]}"
@@ -584,7 +590,7 @@ class TopAgent:
         if self.redirect_log:
             with open(f"{log_dir_per_run}/mage_rtl.log", "r") as f:
                 content = f.read()
-            content = re.sub(r"\[.*?m", "", content)
+            content = re.sub(r"\[.*?m", "", content)
             with open(f"{log_dir_per_run}/mage_rtl_rich_free.log", "w") as f:
                 f.write(content)
         return result

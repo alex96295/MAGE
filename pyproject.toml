@@ -30,7 +30,8 @@ dependencies = [
   "pydantic",
   "rich",
   "tiktoken",
-  "ollama"
+  "ollama",
+  "rank-bm25"
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",

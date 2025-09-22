@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import faiss
 import numpy as np
 from llama_index.core.base.embeddings.base import BaseEmbedding
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from rank_bm25 import BM25Okapi
 
 from .log_utils import get_logger
@@ -19,6 +19,9 @@ class _LibItem(BaseModel):
     json_obj: Dict[str, Any]
     text: str
     vector: Optional[np.ndarray] = None
+
+    # pydantic v2: allow numpy arrays
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 def _flatten_lib_json(j: Dict[str, Any]) -> str:
@@ -100,8 +103,8 @@ class LibConsultant:
                 self._texts.append(text)
                 loaded += 1
             except Exception as e:
-                logger.warning(f"[LibConsultant] Skipping {p}: {e}")
-        logger.info(f"[LibConsultant] Ingested {loaded} modules from {lib_dir}")
+                logger.warning(f"LibConsultant Skipping {p}: {e}")
+        logger.info(f"LibConsultant Ingested {loaded} modules from {lib_dir}")
         return loaded
 
     def ingest_from_list(self, modules: Sequence[Dict[str, Any]]) -> int:
@@ -114,8 +117,8 @@ class LibConsultant:
                 self._texts.append(text)
                 loaded += 1
             except Exception as e:
-                logger.warning(f"[LibConsultant] Skipping in-memory item: {e}")
-        logger.info(f"[LibConsultant] Ingested {loaded} in-memory modules")
+                logger.warning(f"LibConsultant Skipping in-memory item: {e}")
+        logger.info(f"LibConsultant Ingested {loaded} in-memory modules")
         return loaded
 
     def build_index(self) -> None:
@@ -123,7 +126,7 @@ class LibConsultant:
         Build FAISS (dense) and BM25 (lexical) indexes.
         """
         if not self.items:
-            logger.warning("[LibConsultant] No items to index.")
+            logger.warning("LibConsultant No items to index.")
             return
 
         # Dense embeddings (FAISS)
@@ -142,13 +145,13 @@ class LibConsultant:
             self.faiss_index = faiss.IndexFlatIP(self.dim)
             self.faiss_index.add(mat)
             logger.info(
-                f"[LibConsultant] FAISS index built. dim={self.dim}, n={len(self.items)}"
+                f"LibConsultant FAISS index built. dim={self.dim}, n={len(self.items)}"
             )
         else:
             self.faiss_index = None
             self._mat = None
             self.dim = None
-            logger.warning("[LibConsultant] No vectors to add to FAISS.")
+            logger.warning("LibConsultant No vectors to add to FAISS.")
 
         # Lexical tokens (BM25)
         def _tok(s: str) -> List[str]:
@@ -158,10 +161,10 @@ class LibConsultant:
         self._bm25_corpus_tokens = [_tok(t) for t in self._texts]
         if self._bm25_corpus_tokens:
             self._bm25 = BM25Okapi(self._bm25_corpus_tokens)
-            logger.info(f"[LibConsultant] BM25 index built. n={len(self.items)}")
+            logger.info(f"LibConsultant BM25 index built. n={len(self.items)}")
         else:
             self._bm25 = None
-            logger.warning("[LibConsultant] No texts for BM25.")
+            logger.warning("LibConsultant No texts for BM25.")
 
     def _search_dense(
         self, query_text: str, fanout: int
@@ -252,7 +255,7 @@ class LibConsultant:
             ranks_bm25: Dict[int, int] = {
                 int(i): int(r + 1) for r, i in enumerate(bm25_idxs)
             }
-            fused = self._rrf_fuse(n, ranks_dense, ranks_bm25, k=60.0)
+            fused = self._rrf_fuse(n, ranks_dense, ranks_bm25, k=3.0)
             return [(idx, float(score)) for idx, score in fused[:top_k] if score > 0.0]
 
         # Weighted-sum fusion (score normalization)
@@ -277,6 +280,7 @@ class LibConsultant:
         method: str = "rrf",
         alpha: float = 0.65,
     ) -> Optional[Dict[str, Any]]:
+
         hits = self._search_hybrid(
             query_text=query_text,
             top_k=top_k,
@@ -295,7 +299,7 @@ class LibConsultant:
     def consult(
         self,
         design_plan: Dict[str, Any],
-        score_threshold: float = 0.30,
+        score_threshold: float = 0.49,
         top_k: int = 1,
         *,
         fanout: int = 5,
@@ -312,6 +316,7 @@ class LibConsultant:
           method: "rrf" for Reciprocal Rank Fusion, or "weighted" for normalized weighted sum.
           alpha: weight for dense scores in "weighted" fusion (ignored for "rrf").
         """
+
         out = LibConsultantOutput(reuse={}, consult={})
 
         for top_key in ("reuse", "consult"):

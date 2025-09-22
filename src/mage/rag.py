@@ -18,6 +18,8 @@ from llama_index.core.chat_engine import ContextChatEngine
 from llama_index.core.indices.property_graph import VectorContextRetriever
 from llama_index.core.llms.llm import LLM
 from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.prompts.base import PromptTemplate
+from llama_index.core.prompts.prompt_type import PromptType
 from llama_index.core.retrievers import BaseRetriever, QueryFusionRetriever
 
 # Neo4j property graph store (optional)
@@ -29,6 +31,48 @@ from llama_index.vector_stores.faiss import FaissVectorStore
 from .log_utils import get_logger
 
 logger = get_logger(__name__)
+
+CUSTOM_TEXT_QA_PROMPT_TMPL = (
+    "You are an expert Q&A system that is trusted around the world.\n"
+    "Always answer using the provided context.\n"
+    "Rules:\n"
+    "1. Don't directly reference 'the context'.\n"
+    "2. Provide clear, concise answers.\n"
+    "---------------------\n"
+    "{context_str}\n"
+    "---------------------\n"
+    "Query: {query_str}\n"
+    "Answer: "
+)
+CUSTOM_TEXT_QA_PROMPT = PromptTemplate(
+    CUSTOM_TEXT_QA_PROMPT_TMPL, prompt_type=PromptType.QUESTION_ANSWER
+)
+
+CUSTOM_REFINE_PROMPT_TMPL = (
+    "You're refining a prior answer using new context.\n"
+    "If needed, rewrite. Otherwise, repeat.\n"
+    "New Context: {context_msg}\n"
+    "Query: {query_str}\n"
+    "Original Answer: {existing_answer}\n"
+    "New Answer: "
+)
+CUSTOM_REFINE_PROMPT = PromptTemplate(
+    CUSTOM_REFINE_PROMPT_TMPL, prompt_type=PromptType.REFINE
+)
+
+CUSTOM_CODE_QA_PROMPT_TMPL = (
+    "You are a coding assistant that provides detailed technical answers.\n"
+    "Use the provided context (which may include source code) to be accurate.\n"
+    "Context:\n"
+    "---------------------\n"
+    "{context_str}\n"
+    "---------------------\n"
+    "Query: {query_str}\n"
+    "Answer (with code snippets if relevant): "
+)
+CUSTOM_CODE_QA_PROMPT = PromptTemplate(
+    CUSTOM_CODE_QA_PROMPT_TMPL, prompt_type=PromptType.QUESTION_ANSWER
+)
 
 
 @dataclass
@@ -73,26 +117,28 @@ class VectorIndexManager:
         """Create a FAISS-backed index or load from disk if present."""
         # If a persisted index exists -> load it
         if self.settings.faiss_path and os.path.exists(self.settings.faiss_path):
-            logger.info("Loading existing persisted vector store and index")
+            logger.info(
+                "VectorIndexManager Loading existing persisted vector store and index"
+            )
             vector_store = FaissVectorStore.from_persist_path(self.settings.faiss_path)
             storage_context = StorageContext.from_defaults(
                 persist_dir=self.settings.persist_dir,
                 vector_store=vector_store,
             )
-            index = load_index_from_storage(storage_context)
-            logger.info("Loaded existing FAISS vector index.")
+            index = load_index_from_storage(
+                storage_context, embed_model=self.settings.embed_model
+            )
+            logger.info(index)
+            logger.info("VectorIndexManager Loaded existing FAISS vector index")
             return index
 
         # Otherwise, build from documents
-        logger.info("No existing vector store/index found. Creating new one...")
+        logger.info(
+            "VectorIndexManager No existing vector store/index found. Creating new one..."
+        )
         vector_store = None
-        logger.info(faiss.__version__)
-        logger.info(faiss.get_compile_options())
         faiss_index = faiss.IndexFlatIP(self.settings.embedding_dim)
-        logger.info("Debug")
-        logger.info(faiss_index)
         vector_store = FaissVectorStore(faiss_index=faiss_index)
-        logger.info(vector_store)
 
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
@@ -105,11 +151,11 @@ class VectorIndexManager:
         )
 
         # Persist both the storage and FAISS index (if path provided)
-        logger.info("Persisting newly created vector index")
+        logger.info("VectorIndexManager Persisting newly created vector index")
         vector_store.persist(persist_path=self.settings.faiss_path)
         index.storage_context.persist(persist_dir=self.settings.persist_dir)
         logger.info(
-            f"Persisted FAISS vector index to {self.settings.faiss_path} and storage to {self.settings.persist_dir}."
+            f"VectorIndexManager Persisted FAISS vector index to {self.settings.faiss_path} and storage to {self.settings.persist_dir}."
         )
         return index
 
@@ -267,8 +313,12 @@ class ChatEngineFactory:
             retriever=retriever,
             llm=llm or Settings.llm,
             memory=memory,
-            context_template=(templates.context_template if templates else None),
-            context_refine_template=(templates.refine_template if templates else None),
+            context_template=(
+                templates.context_template if templates else CUSTOM_TEXT_QA_PROMPT
+            ),
+            context_refine_template=(
+                templates.refine_template if templates else CUSTOM_REFINE_PROMPT
+            ),
         )
 
     @staticmethod
@@ -282,8 +332,12 @@ class ChatEngineFactory:
             retriever=retriever,
             llm=code_llm or Settings.code_llm or Settings.llm,
             memory=memory,
-            context_template=(templates.context_template if templates else None),
-            context_refine_template=(templates.refine_template if templates else None),
+            context_template=(
+                templates.context_template if templates else CUSTOM_CODE_QA_PROMPT
+            ),
+            context_refine_template=(
+                templates.refine_template if templates else CUSTOM_REFINE_PROMPT
+            ),
         )
 
 
@@ -297,7 +351,11 @@ def create_vector_retriever_from_docs(
     """
     v_manager = VectorIndexManager(v_settings)
     v_index = v_manager.build_or_load(documents)
+
+    logger.info(v_index)
     v_retriever = RetrieverFactory.vector(v_index, top_k=top_k)
+
+    logger.info(v_retriever)
     return v_index, v_retriever
 
 
