@@ -63,10 +63,10 @@ def sim_review(
     tb_path = f"{output_path_per_run}/tb.sv"
     if golden_rtl_path is None:
         golden_rtl_path = ""
-    if os.path.isfile(vvp_name):
-        os.remove(vvp_name)
     match simulator:
         case "iverilog":
+            if os.path.isfile(vvp_name):
+                os.remove(vvp_name)
             cmd = "oseda -2025.03 iverilog -Wall -Winfloop -Wno-timescale -g2012 -o {} {} {} {} {}; oseda -2025.03 vvp -n {}".format(
                 vvp_name, tb_path, rtl_path_lib, rtl_path, golden_rtl_path, vvp_name
             )
@@ -110,6 +110,7 @@ class SimReviewer:
 
 
 def sim_review_golden(
+    simulator: str,
     rtl_path: str,
     task_id: str,
     benchmark_type: TypeBenchmark,
@@ -117,39 +118,49 @@ def sim_review_golden(
     output_path_per_run: str,
 ) -> Tuple[bool, str]:
 
-    if (
-        benchmark_type == TypeBenchmark.VERILOG_EVAL_V2
-        or benchmark_type == TypeBenchmark.VERILOG_EVAL_V1
-    ):
-        folder = (
-            "dataset_code-complete-iccad2023"
-            if benchmark_type == TypeBenchmark.VERILOG_EVAL_V1
-            else "dataset_spec-to-rtl"
-        )
-        tb_path = f"{output_path_per_run}/tb.sv"
-        ref_path = f"{benchmark_path}/{folder}/{task_id}_ref.sv"
-        vvp_name = f"{output_path_per_run}/sim_golden.vvp"
-        if os.path.isfile(vvp_name):
-            os.remove(vvp_name)
-        cmd = "oseda -2025.03 iverilog -Wall -Winfloop -Wno-timescale -g2012 -s tb -o {} {} {} {}; oseda -2025.03 vvp -n {}".format(
-            vvp_name, tb_path, rtl_path, ref_path, vvp_name
-        )
-        is_pass, sim_output = run_bash_command(cmd, timeout=60)
-        sim_output_obj = CommandResult.model_validate_json(sim_output)
-        is_pass = (
-            is_pass
-            and "First mismatch occurred at time" not in sim_output_obj.stdout
-            and (
-                sim_output_obj.stderr == ""
-                or stderr_all_lines_benign(sim_output_obj.stderr)
+    match benchmark_type:
+        case TypeBenchmark.VERILOG_EVAL_V1:
+            folder = os.path.join(benchmark_path, "dataset_code-complete-iccad2023")
+        case TypeBenchmark.VERILOG_EVAL_V2:
+            folder = os.path.join(benchmark_path, "dataset_spec-to-rtl")
+        case TypeBenchmark.PULP_VERILOG_EVAL:
+            folder = os.path.join(benchmark_path, "out/bench")
+        case _:
+            raise ValueError(f"Invalid benchmark_type: {benchmark_type}")
+
+    tb_path = f"{output_path_per_run}/tb.sv"
+    ref_path = f"{benchmark_path}/{folder}/{task_id}_ref.sv"
+    vvp_name = f"{output_path_per_run}/sim_golden.vvp"
+    rtl_path_lib = os.path.join(os.path.dirname(rtl_path), "rtl_lib.sv")
+
+    match simulator:
+        case "iverilog":
+            if os.path.isfile(vvp_name):
+                os.remove(vvp_name)
+            cmd = "oseda -2025.03 iverilog -Wall -Winfloop -Wno-timescale -g2012 -s tb -o {} {} {} {} {}; oseda -2025.03 vvp -n {}".format(
+                vvp_name, tb_path, rtl_path_lib, rtl_path, ref_path, vvp_name
             )
+        case "questa":
+            cmd = 'questa-2023.4 vlog {} {} {} {} && questa-2023.4 vopt -permissive -suppress 3009 -suppress 8386 -error 7 +UVM_NO_RELNOTES -O5 TopTestbench -o TopTestbench_opt && questa-2023.4 vsim -c TopTestbench_opt -t 1ps -suppress 3009 -suppress 8386 -error 7 -cpppath /usr/bin/g++ -do "run -all; quit -f"'.format(
+                rtl_path_lib, rtl_path, ref_path, tb_path
+            )
+    is_pass, sim_output = run_bash_command(cmd, timeout=60)
+    sim_output_obj = CommandResult.model_validate_json(sim_output)
+    is_pass = (
+        is_pass
+        and "First mismatch occurred at time" not in sim_output_obj.stdout
+        and (
+            sim_output_obj.stderr == ""
+            or stderr_all_lines_benign(sim_output_obj.stderr)
         )
-        logger.info(f"Golden simulation is_pass: {is_pass}, \noutput: {sim_output}")
-        return is_pass, sim_output
+    )
+    logger.info(f"Golden simulation is_pass: {is_pass}, \noutput: {sim_output}")
+    return is_pass, sim_output
     raise NotImplementedError  # Should not reach here
 
 
 def sim_review_golden_benchmark(
+    simulator: str,
     task_id: str,
     output_path: str,
     benchmark_type: TypeBenchmark,
@@ -158,7 +169,12 @@ def sim_review_golden_benchmark(
     output_path_per_run = f"{output_path}/{benchmark_type.name}_{task_id}"
     rtl_path = f"{output_path_per_run}/rtl.sv"
     is_pass, sim_output = sim_review_golden(
-        rtl_path, task_id, benchmark_type, benchmark_path, output_path_per_run
+        simulator,
+        rtl_path,
+        task_id,
+        benchmark_type,
+        benchmark_path,
+        output_path_per_run,
     )
     with open(f"{output_path_per_run}/sim_review_output.json", "w") as f:
         f.write(
@@ -170,6 +186,7 @@ def sim_review_golden_benchmark(
 
 
 def sim_review_golden_benchmark_batch(
+    simulator: str,
     task_id_list: List[str],
     log_path: str,
     output_path: str,
@@ -180,6 +197,6 @@ def sim_review_golden_benchmark_batch(
     for task_id in task_id_list:
         set_log_dir(f"{log_path}/golden_review_{benchmark_type.name}_{task_id}")
         ret[task_id] = sim_review_golden_benchmark(
-            task_id, output_path, benchmark_type, benchmark_path
+            simulator, task_id, output_path, benchmark_type, benchmark_path
         )
     return ret

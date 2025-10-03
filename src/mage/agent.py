@@ -150,6 +150,9 @@ class TopAgent:
         self._design_plan_json = design_plan_json or ""
         self._lib_hints_json = lib_hints_json or ""
 
+        logger.info(self._design_plan_json)
+        logger.info(self._lib_hints_json)
+
         try:
             self.write_output(self._design_plan_json, "design_plan.json")
             self.write_output(self._lib_hints_json, "lib_hints.json")
@@ -158,7 +161,7 @@ class TopAgent:
 
         return self._design_plan_json, self._lib_hints_json
 
-    def run_instance(self, spec: str) -> Tuple[bool, str]:
+    def run_instance(self, spec: str, simulator: str) -> Tuple[bool, str]:
         """
         Run a single instance of the benchmark
         Return value:
@@ -187,7 +190,6 @@ class TopAgent:
         self.rtl_gen.reset()
         logger.info(spec)
 
-        # Pass plan/lib hints
         is_syntax_pass, rtl_code, _ = self.rtl_gen.chat(
             input_spec=spec,
             testbench=testbench,
@@ -208,7 +210,7 @@ class TopAgent:
         for i in range(self.sim_max_retry):
             # run simulation judge, overwrite is_sim_pass
             is_sim_pass, sim_mismatch_cnt, sim_log = self.sim_reviewer.review(
-                simulator="questa"
+                simulator=simulator
             )
             if is_sim_pass:
                 tb_need_fix = False
@@ -271,7 +273,7 @@ class TopAgent:
                     continue
                 self.write_output(rtl_code_candidate, "rtl.sv")
                 is_sim_pass_candidate, sim_mismatch_cnt_candidate, sim_log_candidate = (
-                    self.sim_reviewer.review(simulator="questa")
+                    self.sim_reviewer.review(simulator=simulator)
                 )
                 if is_sim_pass_candidate:
                     rtl_code = rtl_code_candidate
@@ -313,7 +315,7 @@ class TopAgent:
                     break
 
         if not is_sim_pass:  # Run if keep failing before last try
-            is_sim_pass, _, _ = self.sim_reviewer.review(simulator="questa")
+            is_sim_pass, _, _ = self.sim_reviewer.review(simulator=simulator)
 
         # policy/consistency check vs style guide (based on descriptive rules)
         if is_sim_pass and self.style_reviewer is not None:
@@ -337,7 +339,7 @@ class TopAgent:
 
             # Re-run sim to ensure no behavior change
             style_sim_pass, _, style_sim_log = self.sim_reviewer.review(
-                simulator="questa"
+                simulator=simulator
             )
             if style_sim_pass:
                 logger.info("[StyleReviewer] Simulation PASSED after styling.")
@@ -366,7 +368,7 @@ class TopAgent:
                 self.write_output(original_rtl, "rtl.sv")
                 self.write_output(original_tb, "tb.sv")
                 # Ensure sim still passes with originals (it should)
-                _ = self.sim_reviewer.review(simulator="questa")
+                _ = self.sim_reviewer.review(simulator=simulator)
 
         # rule-driven lint/formatting
         if is_sim_pass and self.lint_reviewer is not None:
@@ -398,7 +400,7 @@ class TopAgent:
 
             # Re-run sim to ensure no behavior change post-lint/format
             lint_sim_pass, _, lint_sim_log = self.sim_reviewer.review(
-                simulator="questa"
+                simulator=simulator
             )
             if lint_sim_pass:
                 logger.info("[LintReviewer] Simulation PASSED after format+lint.")
@@ -436,11 +438,11 @@ class TopAgent:
                 self.write_output(lr_in_rtl, "rtl.sv")
                 self.write_output(lr_in_tb, "tb.sv")
                 # Sanity: re-run sim to confirm ok
-                _ = self.sim_reviewer.review(simulator="questa")
+                _ = self.sim_reviewer.review(simulator=simulator)
 
         return is_sim_pass, rtl_code
 
-    def run_instance_ablation(self, spec: str) -> Tuple[bool, str]:
+    def run_instance_ablation(self, spec: str, simulator: str) -> Tuple[bool, str]:
         """
         Run a single instance of the benchmark in ablation mode
         Return value:
@@ -461,7 +463,7 @@ class TopAgent:
         self.write_output(rtl_code, "rtl.sv")
         return is_syntax_pass, rtl_code
 
-    def _run(self, spec: str) -> Tuple[bool, str]:
+    def _run(self, spec: str, simulator: str) -> Tuple[bool, str]:
         try:
             if os.path.exists(f"{self.output_dir_per_run}/properly_finished.tag"):
                 os.remove(f"{self.output_dir_per_run}/properly_finished.tag")
@@ -548,7 +550,7 @@ class TopAgent:
             self.lint_reviewer.set_lint_autofix(mode="inplace")
 
             ret = (
-                self.run_instance(spec)
+                self.run_instance(spec, simulator)
                 if not self.is_ablation
                 else self.run_instance_ablation(spec)
             )
@@ -563,7 +565,8 @@ class TopAgent:
 
     def run(
         self,
-        benchmark_type_name: str,
+        simulator: str,
+        log_prefix: str,
         task_id: str,
         spec: str,
         golden_tb_path: str | None = None,
@@ -571,8 +574,8 @@ class TopAgent:
     ) -> Tuple[bool, str]:
         self.golden_tb_path = golden_tb_path
         self.golden_rtl_blackbox_path = golden_rtl_blackbox_path
-        log_dir_per_run = f"{self.log_path}/{benchmark_type_name}_{task_id}"
-        self.output_dir_per_run = f"{self.output_path}/{benchmark_type_name}_{task_id}"
+        log_dir_per_run = f"{self.log_path}/{log_prefix}_{task_id}"
+        self.output_dir_per_run = f"{self.output_path}/{log_prefix}_{task_id}"
         os.makedirs(self.output_path, exist_ok=True)
         os.makedirs(self.output_dir_per_run, exist_ok=True)
         set_log_dir(log_dir_per_run)
@@ -580,11 +583,11 @@ class TopAgent:
             with open(f"{log_dir_per_run}/mage_rtl.log", "w") as f:
                 sys.stdout = f
                 sys.stderr = f
-                result = self._run(spec)
+                result = self._run(spec, simulator)
             sys.stdout = sys.__stdout__
             sys.stderr = sys.__stderr__
         else:
-            result = self._run(spec)
+            result = self._run(spec, simulator)
         # Redirect log contains format with rich text.
         # Provide a rich-free version for log parsing or less viewing.
         if self.redirect_log:

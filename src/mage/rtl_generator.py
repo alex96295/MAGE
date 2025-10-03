@@ -118,15 +118,36 @@ To understand the error message better, we offered a version of generated main m
 
 EXAMPLE_OUTPUT = {
     "reasoning": "All reasoning steps and advices to avoid syntax error",
-    "module": "Pure SystemVerilog code, a complete module",
+    "module": "Pure SystemVerilog code, it can be (1) the designed primary module only, or (2) the primary module and any other secondary module you added to keep modularity.",
 }
+
+SECONDARY_MODULE_GUIDANCE_PROMPT = r"""
+RTL Module Decomposition Principles:
+
+- Single responsibility: Each module should implement one clear function or behavior (e.g., "arbiter," "FIFO," "decoder").
+- Clear boundaries: Define clean input/output interfaces. Avoid exposing internal details.
+- Interfaces, not spaghetti: Use 'interface' and 'modport' constructs to group related signals. Keep port lists simple and meaningful.
+- Parameterization: Prefer parameters/generics over duplicating logic (e.g., data width, depth, latency).
+- Hierarchy & layering: Structure designs top-down: system ? subsystems ? components. Higher levels orchestrate, lower levels implement.
+- Encapsulation: Hide internal registers, state machines, and timing details; expose only what's needed for integration.
+- Reusability: Design modules to be portable and usable in multiple projects or contexts.
+- Composability: Make modules easy to combine without rewiring or rewriting logic.
+- Testability & observability: Provide clean hooks for simulation, assertions, or monitors. Ensure modules are verifiable in isolation.
+- Clock/reset domains: Keep synchronous logic within a module consistent; handle CDC (clock domain crossing) at explicit boundaries.
+- Resource awareness: Factor in synthesis constraints (timing, area, power). Don't over-partition critical paths.
+- Balance granularity; avoid both extremes:
+  * Over-flattening: monolithic modules that mix multiple responsibilities.
+  * Over-modularizing: too many tiny modules that complicate wiring and increase overhead.
+- Consistent style: Use uniform naming, signal grouping, and port ordering to make modules predictable and maintainable.
+"""
 
 INTEGRATION_GUIDANCE_PROMPT = r"""
 You are given two structured inputs from an independent agent based on the
 input spec defined above for the module to be designed. These strctured inputs
 represent the reasoning of the independent agent in understanding the
-high-level building blocks (submodules) of the design, and the effective
-submodules present in the available RTL library.
+high-level building blocks (submodules) of the design ('planner_json'), and the
+effective submodules present in the available RTL library
+('lib_consultant_json').
 
 <planner_json>
 {planner_json}
@@ -137,31 +158,33 @@ submodules present in the available RTL library.
 </lib_consultant_json>
 
 How to use them:
-1) Reuse candidates are under lib_consultant_json.reuse.*.library_json.
+1) Reuse candidates are under lib_consultant_json.reuse.*.library_json if library_json != null.
    - Use the interface (parameters + ports) exactly as listed to INSTANTIATE those modules inside your new design.
    - Do not alter reused module port names, directions, or parameter names.
    - Define connetion signals with the right type and width for proper connection between the instantiated modules and the surrounding logic.
-2) Do not include the reused module source body in your own "module" output.
+2) Do not include the reused module source body in your own primary module output, as they are included separately.
    - The build system will append the correct reused module declarations/definitions after your new module.
    - Your job: instantiate them correctly (parameters/ports, widths, resets, naming).
-3) If no confident match exists (library_json == null), implement the needed logic yourself.
-4) Prefer naming conventions / structure suggested by the planner_json when reasonable.
-5) If a preliminary interface is provided, it takes precedence over any other suggestion.
-6) Output only one complete SystemVerilog module for the requested design, not testbench code.
+3) If no confident match exists (library_json == null), implement the needed logic yourself. Decide whether to flatten the logic in the primary module, or create a secondary module, following these rules:
+
+   {secondary_module_best_practices}
+
+   - If created, append this secondary module at the end of the primary module.
+4) Output only one complete SystemVerilog module for the requested design, not testbench code.
 
 When instantiating reused modules:
 - Map your top-level interface signals to the reused module ports clearly and consistently.
 - Declare any internal wires/regs (logic) needed to connect to those instances.
 - Avoid `unique/unique0`, avoid `inside`, and follow the rest of the RTL rules above.
 
-You will ONLY author the primary design module.
+You will ONLY author the primary design module and potential secondary design modules.
 Reused library modules are appended automatically by the build system.
 
 Rules:
 - Instantiate reused modules using the interface in <lib_consultant_json>.
 - Do NOT include reused module source bodies in your output.
-- If you are shown a previous file that contains the primary module PLUS appended reused module declarations, IGNORE those appended modules. ONLY modify and output the primary module.
-- Your response must contain exactly one complete SystemVerilog module: the primary design.
+- Your response must contain one complete SystemVerilog module: the primary
+design module and potential secondary design modules.
 """
 
 
@@ -298,6 +321,7 @@ class RTLGenerator:
                     content=INTEGRATION_GUIDANCE_PROMPT.format(
                         planner_json=self.planner_json_str or "{}",
                         lib_consultant_json=self.lib_consult_json_str or "{}",
+                        secondary_module_best_practices=SECONDARY_MODULE_GUIDANCE_PROMPT,
                     ),
                     role=MessageRole.USER,
                 )

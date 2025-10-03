@@ -71,8 +71,8 @@ Please also follow the display prompt below:
 
 GOLDEN_TB_PROMPT = r"""
 In order to test a module generated with the given natural language specification:
-1. Please write an IO interface for that module;
-2. Please improve the given golden testbench to test the module.
+1. Write an IO interface for that module;
+2. Improve the given golden testbench to test the module.
 
 The module interface should EXACTLY MATCH the description in input_spec.
 (Including the module name, input/output ports names, and their types)
@@ -81,19 +81,20 @@ The module interface should EXACTLY MATCH the description in input_spec.
 {input_spec}
 </input_spec>
 
-To improve the golden testbench, you should add more display to it, while keeping the original functionality.
-In detail, the testbench you generated should:
-1. MAINTAIN the EXACT SAME functionality, interface and module instantiation  as the golden testbench;
+Important: to improve the golden testbench, you must add more display to it, while keeping the original functionality.
+In detail, the testbench you generated must:
+1. MAINTAIN the EXACT SAME functionality, interface and module instantiation as the golden testbench;
 2. If the golden testbench contradicts the input_spec, ALWAYS FOLLOW the golden testbench;
 3. MAINTAIN the original logic of error counting;
 4. When simulation ends, ADD DISPLAY "SIMULATION PASSED" if no mismatch occurs, otherwise display:
     "SIMULATION FAILED - x MISMATCHES DETECTED, FIRST AT TIME y".
-Please also follow the display prompt below:
+Also follow the display prompt below:
 {display_prompt}
 
 
-Try to understand the requirements above and give reasoning steps in natural language to achieve it.
-In addition, try to give advice to avoid syntax error.
+Understand the requirements above and give reasoning steps in natural language to achieve it.
+Do not forget any of the requirements, especially testbench improvement with display.
+In addition, give advice to avoid syntax error.
 An SystemVerilog module always starts with a line starting with the keyword 'module' followed by the module name.
 It ends with the keyword 'endmodule'.
 
@@ -174,7 +175,7 @@ end
 
 
 EXAMPLE_OUTPUT = {
-    "reasoning": "All reasoning steps and advices to avoid syntax error",
+    "reasoning": "All reasoning steps to meet the prompt requirements, plus advices to avoid syntax error",
     "interface": "The IO part of a SystemVerilog module, not containing the module implementation",
     "testbench": "The testbench code to test the module",
 }

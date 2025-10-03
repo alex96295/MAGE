@@ -14,30 +14,15 @@ from mage.benchmark_read_helper import (
 )
 from mage.gen_config import get_llm, set_exp_setting
 from mage.log_utils import get_logger
-from mage.sim_reviewer import sim_review_golden_benchmark
 from mage.token_counter import TokenCount
 
 logger = get_logger(__name__)
 
-args_dict = {
+DEFAULTS = {
     "provider": "openai",
-    # "provider": "fireworks",
-    # "provider": "ollama",
-    # "model": "claude-3-7-sonnet@20250219",
-    # "model": "deepseek-coder-v2:16b",
-    # "model": "llama3.2:latest",
-    # "model": "gpt-oss:20b",
-    # "model": "deepseek-r1:14b",
-    # "model": "gemini-2.0-flash-001",
-    # "model": "claude-3-7-sonnet-20250219",
     "model": "gpt-4o-2024-08-06",
-    # "model": "gpt-5-mini",
-    # "filter_instance": "^(Prob070_ece241_2013_q2|Prob151_review2015_fsm)$",
     "filter_instance": "^(Prob006_stream_xbar)$",
-    # "filter_instance": "^(.*)$",
-    # "type_benchmark": "verilog_eval_v2",
     "type_benchmark": "pulp_verilog_eval",
-    # "path_benchmark": "./verilog-eval",
     "path_benchmark": "./pulp-verilog-eval",
     "run_identifier": "exp00",
     "n": 1,
@@ -46,35 +31,114 @@ args_dict = {
     "max_token": 8192,
     "use_golden_tb_in_mage": True,
     "key_cfg_path": "./key.cfg",
+    "simulator": "questa",
+    "input_spec": None,
+    "input_rtl": None,
+    "rtl_top": None,
+    "input_tb": None,
 }
 
 
-def run_round(args: argparse.Namespace, llm: LLM):
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Unifies the 'benchmark suite' and 'spare design' frontends into one CLI.
+
+    Defaults mirror the previously hardcoded args_dict_benchmark_suite.
+    Spare design mode triggers if --input-spec, --input-tb, and --rtl-top are provided.
+    --input-rtl is OPTIONAL in spare design mode.
+    """
+    p = argparse.ArgumentParser(
+        description="Unified runner for benchmark suite or spare design."
+    )
+    # Common / provider & model
+    p.add_argument("--provider", default=DEFAULTS["provider"], help="LLM provider.")
+    p.add_argument("--model", default=DEFAULTS["model"], help="LLM model name.")
+    p.add_argument(
+        "--key-cfg-path",
+        default=DEFAULTS["key_cfg_path"],
+        help="Path to API key/config file.",
+    )
+    p.add_argument(
+        "--max-token", type=int, default=DEFAULTS["max_token"], help="Max tokens."
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=DEFAULTS["temperature"],
+        help="Sampling temperature.",
+    )
+    p.add_argument("--top-p", type=float, default=DEFAULTS["top_p"], help="Top-p.")
+    p.add_argument(
+        "--run-identifier",
+        default=DEFAULTS["run_identifier"],
+        help="Run identifier prefix.",
+    )
+    p.add_argument("-n", type=int, default=DEFAULTS["n"], help="Number of rounds.")
+    p.add_argument(
+        "--use-golden-tb-in-mage",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULTS["use_golden_tb_in_mage"],
+        help="Whether to pass golden TB/RTL paths into mage (bool).",
+    )
+    p.add_argument(
+        "--simulator",
+        default=DEFAULTS["simulator"],
+        help="Simulator backend (e.g., questa).",
+    )
+
+    # Benchmark suite options
+    p.add_argument(
+        "--type-benchmark",
+        default=DEFAULTS["type_benchmark"],
+        help="Benchmark type key (e.g., pulp_verilog_eval).",
+    )
+    p.add_argument(
+        "--path-benchmark",
+        default=DEFAULTS["path_benchmark"],
+        help="Path to benchmark root.",
+    )
+    p.add_argument(
+        "--filter-instance",
+        default=DEFAULTS["filter_instance"],
+        help="Regex to filter which instances to run (for benchmark mode).",
+    )
+
+    # Spare design options
+    p.add_argument(
+        "--input-spec",
+        default=DEFAULTS["input_spec"],
+        help="Path to a single design spec file.",
+    )
+    p.add_argument(
+        "--input-rtl",
+        default=DEFAULTS["input_rtl"],
+        help="Path to golden RTL (blackbox) file/folder. Optional.",
+    )
+    p.add_argument(
+        "--rtl-top",
+        default=DEFAULTS["rtl_top"],
+        help="Top module name for the spare design.",
+    )
+    p.add_argument(
+        "--input-tb",
+        default=DEFAULTS["input_tb"],
+        help="Path to golden testbench for the spare design.",
+    )
+
+    return p
+
+
+def run_round(
+    args: argparse.Namespace,
+    llm: LLM,
+    spec_dict: Dict[str, str],
+    golden_tb_path_dict: Dict[str, str],
+    golden_rtl_path_dict: Dict[str, str],
+):
     total_start_time = time.monotonic()
-    type_benchmark = TypeBenchmark[args.type_benchmark.upper()]
-    spec_dict = get_benchmark_contents(
-        type_benchmark,
-        TypeBenchmarkFile.SPEC,
-        args.path_benchmark,
-        args.filter_instance,
-    )
-    golden_tb_path_dict = get_benchmark_contents(
-        type_benchmark,
-        TypeBenchmarkFile.TEST_PATH,
-        args.path_benchmark,
-        args.filter_instance,
-    )
-    golden_rtl_path_dict = get_benchmark_contents(
-        type_benchmark,
-        TypeBenchmarkFile.GOLDEN_PATH,
-        args.path_benchmark,
-        args.filter_instance,
-    )
 
     logger.info(spec_dict)
-
     logger.info(golden_tb_path_dict)
-
     logger.info(golden_rtl_path_dict)
 
     agent = TopAgent(llm)
@@ -86,7 +150,6 @@ def run_round(args: argparse.Namespace, llm: LLM):
     record_json: Dict[str, Dict[str, Any]] = {"record_per_run": {}, "total_record": {}}
 
     ret: dict[str, tuple[bool, str]] = {}
-    review_result: dict[str, tuple[bool, str]] = {}
     pass_cnt = 0
     token_sum = TokenCount(in_token_cnt=0, out_token_cnt=0)
     token_limit_cnt = 0
@@ -94,7 +157,12 @@ def run_round(args: argparse.Namespace, llm: LLM):
         start_time = time.monotonic()
         print(f"({i+1:03d}/{len(spec_dict):03d}) Current task: {task_id}")
         ret[task_id] = agent.run(
-            benchmark_type_name=type_benchmark.name,
+            simulator=args.simulator,
+            log_prefix=(
+                args.type_benchmark.name
+                if args.type_benchmark.name is not None
+                else args.rtl_top
+            ),  # noqa: F821
             task_id=task_id,
             spec=spec,
             golden_tb_path=(
@@ -104,14 +172,9 @@ def run_round(args: argparse.Namespace, llm: LLM):
                 golden_rtl_path_dict[task_id] if args.use_golden_tb_in_mage else None
             ),
         )
+        is_pass = ret[task_id][0]
         run_time = timedelta(seconds=time.monotonic() - start_time)
         print(f"{task_id} took {run_time} to execute")
-        is_pass, golden_sim_log = sim_review_golden_benchmark(
-            task_id=task_id,
-            output_path=agent.output_path,
-            benchmark_type=type_benchmark,
-            benchmark_path=args.path_benchmark,
-        )
         print(f"({i+1:03d}/{len(spec_dict):03d}) {task_id}: is_pass = {is_pass}")
         run_token_cnt = agent.token_counter.get_sum_count()
         print(
@@ -130,7 +193,6 @@ def run_round(args: argparse.Namespace, llm: LLM):
         print(f"{'Current problem token cost':<25}: ${run_cost:.2f} USD")
         token_sum += run_token_cnt
         pass_cnt += is_pass
-        review_result[task_id] = (is_pass, golden_sim_log)
         record_json["record_per_run"][task_id] = {
             "is_pass": is_pass,
             "run_token_limit_cnt": f"{run_token_limit_cnt:.2f}",
@@ -166,7 +228,50 @@ def run_round(args: argparse.Namespace, llm: LLM):
 
 
 def main():
-    args = argparse.Namespace(**args_dict)
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    # Determine mode
+    spare_design_mode = all([args.input_spec, args.input_tb, args.rtl_top])
+
+    if spare_design_mode:
+        with open(args.input_spec, "r") as f:
+            input_spec_str = f.read()
+
+        spec_dict = {args.rtl_top: input_spec_str}
+        golden_tb_path_dict = {args.rtl_top: args.input_tb}
+        golden_rtl_path_dict = {args.rtl_top: args.input_rtl}
+
+        # Make names visible to run_round without touching its core
+        globals()["type_benchmark"] = type("TBName", (), {"name": None})()
+        globals()["rtl_top"] = args.rtl_top
+
+    else:
+        tb_enum_key = args.type_benchmark.upper()
+        tb_enum = TypeBenchmark[tb_enum_key]
+
+        spec_dict = get_benchmark_contents(
+            tb_enum,
+            TypeBenchmarkFile.SPEC,
+            args.path_benchmark,
+            args.filter_instance,
+        )
+        golden_tb_path_dict = get_benchmark_contents(
+            tb_enum,
+            TypeBenchmarkFile.TEST_PATH,
+            args.path_benchmark,
+            args.filter_instance,
+        )
+        golden_rtl_path_dict = get_benchmark_contents(
+            tb_enum,
+            TypeBenchmarkFile.GOLDEN_PATH,
+            args.path_benchmark,
+            args.filter_instance,
+        )
+
+        # Make enum visible to run_round without modifying its internals
+        globals()["type_benchmark"] = tb_enum
+        globals()["rtl_top"] = None
 
     llm = get_llm(
         model=args.model,
@@ -182,7 +287,7 @@ def main():
     for i in range(n):
         print(f"Round {i+1}/{n}")
         args.run_identifier = f"{identifier_head}_{i}"
-        run_round(args, llm)
+        run_round(args, llm, spec_dict, golden_tb_path_dict, golden_rtl_path_dict)
 
 
 if __name__ == "__main__":

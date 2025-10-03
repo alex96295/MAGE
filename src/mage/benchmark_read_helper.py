@@ -21,7 +21,7 @@ class TypeBenchmarkFile(Enum):
 
 
 def get_benchmark_contents(
-    benchmark_type: TypeBenchmark,
+    type_benchmark: TypeBenchmark,
     file_type: TypeBenchmarkFile,
     benchmark_repo: str,
     filter_instance: str,
@@ -29,7 +29,7 @@ def get_benchmark_contents(
     """
     Get Dict of {problem_name: problem_content/testbench_content} for given benchmark
     """
-    match benchmark_type:
+    match type_benchmark:
         case TypeBenchmark.VERILOG_EVAL_V1:
             folder = os.path.join(benchmark_repo, "dataset_code-complete-iccad2023")
         case TypeBenchmark.VERILOG_EVAL_V2:
@@ -37,7 +37,7 @@ def get_benchmark_contents(
         case TypeBenchmark.PULP_VERILOG_EVAL:
             folder = os.path.join(benchmark_repo, "out/bench")
         case _:
-            raise ValueError(f"Invalid benchmark_type: {benchmark_type}")
+            raise ValueError(f"Invalid benchmark_type: {type_benchmark}")
 
     files = os.listdir(folder)
     files.sort()

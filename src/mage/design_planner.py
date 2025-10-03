@@ -15,31 +15,44 @@ from .token_counter import TokenCounter, TokenCounterCached
 logger = get_logger(__name__)
 
 SYSTEM_PROMPT = r"""
-You are an expert RTL Design Planner.
+You are an expert RTL Designer.
 Goal: produce a structured, LLM-readable JSON plan BEFORE any RTL is written.
 You DO NOT write SystemVerilog here. You only plan reuse and consultation,
 following the planning goals below.
 
 Planning goals:
+
 1) REUSE: identify concrete, primitive submodules likely to be instantiated in
 the final design. This are submodules that you wish, as a design planner, to
 have in the design and that another independent agent will try to fetch from a
-design library. This phase of design planning is the high-level equivalent of
-reasoning with the block diagram of the module, based on the specification.
+design library. During this phase of the design planning, you figure out the
+submodules defining the block diagram of the module to be designed based on the
+input specifications. Classical examples of modules that are resued during RTL
+desifn are: fifo, counter, network elements (demultiplxer, multiplexer,
+crossbar), clock gate, SRAM blocks. Be fine-grained in the choice of modules to
+be reused, worst case that can happen they are not present in the library and
+won't give any match.
+
 2) CONSULT: identify similar designs (even with different protocols) to guide
-naming, parameters, and structure. These submodules are not for reuse
-(instantiation) in the design to be generated, but merely for consultancy
-goals. It shows you how similar modules in intent/protocol have been designed
-in an existing design library.
+naming, parameters, and structure. These submodules are not for reuse (i.e.,
+instantiation) in the design to be generated, but merely for consultancy goals.
+The agent performing the RTL design will look at them to shape its design. It
+shows how the design of modules with similar intent/protocol of the module to
+be designed has been approached in an existing design library.
 
 Rules:
-- Base your plan ONLY on the input_spec and (optionally) a provided interface and/or testbench sketch.
-- The plan is a JSON object with exactly two top-level keys: "reuse" and "consult".
-- Under each, create keys like "module1", "module2", ... Each value has:
+- Base your plan ONLY on the input_spec.
+- The plan is a JSON object with exactly two top-level keys: "reuse" and
+  "consult".
+- Under each, create keys like "module1", "module2", ... , "moduleN". Each
+  module key has:
   - "description": short natural language of what to reuse/consult
   - "keywords": list of 8-10 short tokens
   - "protocols": list of protocols or 'generic'
   - "reasoning": a short paragraph explaining why this is relevant
+- The number of modules is at your own discretion, but better to be
+  fine-grained (i.e., many modules) than conservative. Do not assume a fixed
+  number of modules, add as many you think necessary.
 
 Do NOT include any SystemVerilog code. Do NOT add extra top-level fields.
 """
@@ -51,7 +64,7 @@ You will plan for the following design:
 {input_spec}
 </input_spec>
 
-Now: produce ONLY the JSON plan described.
+Produce ONLY the JSON plan described.
 """
 
 ORDER_PROMPT = r"""
@@ -59,7 +72,7 @@ Output constraints (mandatory):
 - Return ONLY valid JSON (no markdown fences, no commentary).
 - Top-level keys MUST be exactly: "reuse" and "consult".
 - Under each, create at least one entry if applicable (module1, module2, ...). If none, use {}.
-- Example shape:
+- Example shape with only one module for the 'reuse' and 'consult' keywords:
 
 {
   "reuse": {
